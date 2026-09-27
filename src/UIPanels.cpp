@@ -1,5 +1,6 @@
 // Bottom panels: library, clip editor, transition editor, Auto DJ, visualiser, help.
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -470,7 +471,7 @@ void App::drawClipEditor() {
         ++c.counter;
         std::snprintf(c.name, sizeof(c.name), "%s clip %d", t.name.c_str(), c.counter);
     }
-    ui::Tip("Creates a new track from the selection (saved as a WAV in user_data/clips)");
+    ui::Tip("Creates a new track from the selection (also saved as a WAV in your clips folder)");
     for (int d = 0; d < 2; ++d) {
         ImGui::SameLine();
         char lbl[32];
@@ -899,9 +900,9 @@ void App::drawHelpWindow() {
     ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(std::min(700.0f, ds.x - 40), std::min(600.0f, ds.y - 40)), ImGuiCond_Appearing);
     bool open = true;
-    if (ImGui::Begin("Quick Start - Dummy DJ", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
+    if (ImGui::Begin("Quick Start - Afterglow", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings)) {
         ImGui::PushFont(fontBig, 24.0f);
-        ImGui::TextColored(ImVec4(0.3f, 0.85f, 1, 1), "Welcome to Dummy DJ!");
+        ImGui::TextColored(ImVec4(0.3f, 0.85f, 1, 1), "Welcome to Afterglow!");
         ImGui::PopFont();
         ImGui::TextWrapped("You can't break anything here. Every knob resets with a double-click, the limiter "
                            "stops the sound from distorting, and SYNC keeps the beats together.");
@@ -917,7 +918,7 @@ void App::drawHelpWindow() {
         ImGui::BulletText("LOOP buttons repeat a few beats on the beat. HOT CUES remember spots to jump back to.");
         ImGui::BulletText("Clip Editor: cut your favourite part of any track into a new clip (saved as WAV).");
         ImGui::BulletText("Transition Editor: duplicate a stock transition and draw your own automation curves.");
-        ImGui::BulletText("Drag your own WAV / MP3 / FLAC files onto the window. Files in ./music load at startup.");
+        ImGui::BulletText("Drag your own WAV / MP3 / FLAC files onto the window, or put them in the music folder (File menu).");
         ImGui::SeparatorText("Keyboard");
         ImGui::TextUnformatted("Q / P  play-pause deck A / B      T  run transition      F  party mode\n"
                                "V  next visual      H  this help      Esc  leave party mode");

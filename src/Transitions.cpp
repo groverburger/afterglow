@@ -1,6 +1,7 @@
 #include "Transitions.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -183,7 +184,7 @@ std::vector<TransitionDef> makeStockTransitions() {
 bool saveTransitions(const std::string& path, const std::vector<TransitionDef>& defs) {
     std::ofstream out(path);
     if (!out) return false;
-    out << "# Dummy DJ custom transitions. Format: key/value lines, one block per transition.\n";
+    out << "# Afterglow custom transitions. Format: key/value lines, one block per transition.\n";
     for (const auto& d : defs) {
         if (d.stock) continue;
         out << "transition " << quoted(d.name) << "\n";

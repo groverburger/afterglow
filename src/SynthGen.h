@@ -16,6 +16,14 @@ enum class SongStyle {
     LoFi,
     AcidTechno,
     ProgHouse,
+    TechHouse,
+    DiscoHouse,
+    BassHouse,
+    UkGarage,
+    LiquidDnb,
+    Neurofunk,
+    JumpUp,
+    Jungle,
 };
 
 struct SongSpec {

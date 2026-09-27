@@ -418,11 +418,12 @@ bool Engine::syncTempo(int d, std::string* why) {
     return true;
 }
 
-void Engine::alignPhase(int d, double masterBeat, double fold) {
+void Engine::alignPhase(int d, double masterBeat, double fold, bool barAlign) {
     Deck& dk = decks[d];
     if (!dk.loaded()) return;
     double b = dk.beatPos();
-    double diff = wrapBar(masterBeat - b * fold);
+    double raw = masterBeat - b * fold;
+    double diff = barAlign ? wrapBar(raw) : raw - std::round(raw);
     double nb = b + diff / fold;
     dk.pos = dk.frameOfBeat(nb);
     if (dk.pos < -dk.framesPerBeat() * 4) dk.pos += 4 * dk.framesPerBeat() / fold;
@@ -462,7 +463,7 @@ void Engine::resetAllFx() {
 
 // ---------------------------------------------------------- transitions ----
 
-bool Engine::startTransition(const TransitionDef& def, int outDeck, std::string* why) {
+bool Engine::startTransition(const TransitionDef& def, int outDeck, std::string* why, bool land) {
     if (transitionBusy()) {
         if (why) *why = "A transition is already running";
         return false;
@@ -476,9 +477,26 @@ bool Engine::startTransition(const TransitionDef& def, int outDeck, std::string*
     run.def = def;
     run.out = outDeck;
     run.in = in;
+    run.land = land;
     run.state = TransitionRun::State::Armed;
     transitionNote.clear();
     return true;
+}
+
+double Engine::landingPreRoll(const TransitionDef& def, int inDeck) const {
+    const Deck& in = decks[inDeck];
+    const Deck& o = decks[otherDeck(inDeck)];
+    if (!in.loaded()) return 0.0;
+    const bool outRunning = o.loaded() && o.playing;
+    double fpb = outRunning ? o.framesPerBeat() / std::max(0.25, o.rate()) : in.framesPerBeat() / std::max(0.25, in.rate());
+    double length = def.beats * fpb;
+    double inStart = outRunning ? def.inStartAt : 0.0;
+    // Predict the tempo the incoming deck will run at once the transition syncs it.
+    double inRate = in.rate();
+    double ratio, fold;
+    if (outRunning && !in.playing && computeSync(inDeck, &ratio, &fold) && std::fabs(ratio - 1.0) <= kTransitionSyncLimit)
+        inRate = ratio;
+    return (1.0 - inStart) * length * inRate;
 }
 
 void Engine::cancelTransition() { run.state = TransitionRun::State::Idle; }
@@ -544,6 +562,11 @@ void Engine::beginTransitionNow() {
                 transitionNote = "Tempos too different to beatmatch - mixing without sync";
             }
         }
+        if (run.land) {
+            // Rewind so the cued spot arrives exactly as the blend completes.
+            in.pos -= (1.0 - run.def.inStartAt) * run.length * in.rate();
+            in.loopActive = false;
+        }
     } else {
         run.synced = in.sync;
     }
@@ -559,7 +582,7 @@ void Engine::startIncoming() {
         double masterBeat = (o.playing && o.motion == Motion::Normal)
                                 ? o.beatPos()
                                 : run.outBeatAtStart + run.elapsed / run.framesPerBeat;
-        alignPhase(run.in, masterBeat, in.syncFold);
+        alignPhase(run.in, masterBeat, in.syncFold, !run.land);
     }
     in.motion = Motion::Normal;
     in.playing = true;

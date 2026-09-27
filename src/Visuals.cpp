@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdio>
+#include <cstdlib>
 
 #include "Engine.h"
 #include "Widgets.h"

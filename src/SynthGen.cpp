@@ -158,9 +158,17 @@ struct PluckP {
     Sends send{0.35f, 0.25f};
 };
 
-enum class DrumPat { FourFloor, Breakbeat, BoomBap };
-enum class BassPat { Offbeat, Octave, Rolling, Reese, Syncop, Sub, Acid };
-enum class ChordInstr { None, Pad, Stabs, Rhodes };
+// Distorted, filter-modulated bass used for bass house, jump-up and neuro.
+struct GrowlP {
+    float lo = 150, hi = 2500, q = 3.0f, drive = 3.0f, detune = 1.008f;
+    float fm = 0.0f, fmRatio = 2.0f, formant = 0.5f, sub = 0.8f, level = 0.3f;
+    bool perNote = false;  // true: one filter sweep per note; false: tempo-synced LFO
+};
+
+enum class DrumPat { FourFloor, Breakbeat, BoomBap, TechHouse, TwoStep, DnbRoll, Jungle };
+enum class BassPat { Offbeat, Octave, Rolling, Reese, Syncop, Sub, Acid, TechRoll, Disco, Growl, Garage, LiquidSub, Neuro,
+                     Wobble, JungleSub };
+enum class ChordInstr { None, Pad, Stabs, Rhodes, Organ };
 enum class LeadInstr { Saw, Square, Rhodes };
 
 struct StyleCfg {
@@ -196,6 +204,16 @@ struct StyleCfg {
     bool lofi = false;
 
     int build1Bars = 8, dropBars = 16, breakBars = 8, build2Bars = 8;
+
+    // Extensions used by the newer styles; defaults keep the originals unchanged.
+    std::vector<int> stabStepsA, stabStepsB;  // stab steps on even/odd bars (empty = legacy)
+    float stabGate = 0.3f;
+    bool padUnderDrop = false;  // layer pads under the drop chords
+    bool perc = false;          // tech-house style rims and bongos
+    float ghostDensity = 0.5f;  // DnB ghost-snare probability
+    bool ride = false;          // DnB ride cymbal on the beat
+    float snarePitch = 1.2f;
+    GrowlP growl;
 };
 
 StyleCfg makeStyle(SongStyle s) {
@@ -320,6 +338,164 @@ StyleCfg makeStyle(SongStyle s) {
         c.prog = {0, 2, 6, 5};
         c.scDepth = 0.6f;
         break;
+    case SongStyle::TechHouse:
+        c.drums = DrumPat::TechHouse;
+        c.kick = {165, 46, 0.03f, 0.24f, 2.2f, 0.28f, 0.95f};
+        c.swing16 = 0.1f;
+        c.perc = true;
+        c.hatLevel = 0.9f;
+        c.bass = BassPat::TechRoll;
+        c.bassP = {170, 800, 0.06f, 2.5f, 0.75f, 0, 2.4f, 0.4f, 0, false};
+        c.chordsDrop = ChordInstr::Stabs;
+        c.chordsBreak = ChordInstr::Pad;
+        c.stabStepsA = {6};
+        c.stabStepsB = {3, 14};
+        c.stab = {350, 2200, 0.07f, 0.28f, 2.5f, 0.1f, 0.4f, {0.55f, 0.35f}};
+        c.pad.cutoff = 1300;
+        c.pad.attack = 0.9f;
+        c.prog = {0, 0, 5, 3};
+        c.chordCenter = 3;
+        c.scDepth = 0.5f;
+        c.dlyBeats = 0.75f;
+        c.dlyFb = 0.5f;
+        break;
+    case SongStyle::DiscoHouse:
+        c.kick = {155, 50, 0.035f, 0.22f, 1.6f, 0.22f, 0.9f};
+        c.swing16 = 0.08f;
+        c.clapLevel = 1.15f;
+        c.bass = BassPat::Disco;
+        c.bassP = {550, 2200, 0.07f, 2.0f, 0.4f, 0, 1.6f, 0.34f, 0, false};
+        c.chordsDrop = ChordInstr::Stabs;
+        c.chordsBreak = ChordInstr::Stabs;
+        c.stabStepsA = {2, 6, 10, 14};
+        c.stabStepsB = {2, 6, 9, 12, 14};
+        c.stabGate = 0.2f;
+        c.stab = {700, 3500, 0.09f, 0.2f, 1.4f, 0.09f, 0.25f, {0.3f, 0.3f}};
+        c.leadDrop2 = c.leadBreak = true;
+        c.lead = LeadInstr::Square;
+        c.prog = {0, 3, 6, 5};
+        c.chordBars = 1;
+        c.sevenths = true;
+        c.chordCenter = 5;
+        c.scDepth = 0.4f;
+        break;
+    case SongStyle::BassHouse:
+        c.kick = {175, 45, 0.028f, 0.26f, 2.6f, 0.32f, 1.0f};
+        c.hatLevel = 1.05f;
+        c.bass = BassPat::Growl;
+        c.growl = {110, 2600, 4.5f, 3.5f, 1.01f, 0.6f, 1.0f, 0.7f, 0.9f, 0.3f, true};
+        c.chordsDrop = ChordInstr::None;
+        c.chordsBreak = ChordInstr::Pad;
+        c.pad.cutoff = 1800;
+        c.arp = true;
+        c.arpStep = 0.5f;
+        c.arpPattern = {0, 2, 1, 3};
+        c.arpP.level = 0.07f;
+        c.prog = {0, 0, 5, 6};
+        c.scDepth = 0.6f;
+        c.scRelease = 0.12f;
+        break;
+    case SongStyle::UkGarage:
+        c.drums = DrumPat::TwoStep;
+        c.kick = {150, 52, 0.03f, 0.2f, 1.5f, 0.25f, 0.95f};
+        c.swing16 = 0.26f;
+        c.perc = true;
+        c.bass = BassPat::Garage;
+        c.bassP = {170, 400, 0.12f, 1.0f, 1.0f, 0, 1.8f, 0.42f, 0, false};
+        c.chordsDrop = ChordInstr::Organ;
+        c.chordsBreak = ChordInstr::Pad;
+        c.stabStepsA = {0, 6, 11};
+        c.stabStepsB = {3, 8, 14};
+        c.stabGate = 0.35f;
+        c.pad.cutoff = 1600;
+        c.pad.attack = 0.6f;
+        c.prog = {0, 5, 3, 4};
+        c.sevenths = true;
+        c.chordCenter = 5;
+        c.scDepth = 0.35f;
+        break;
+    case SongStyle::LiquidDnb:
+        c.drums = DrumPat::DnbRoll;
+        c.kick = {190, 55, 0.025f, 0.17f, 1.6f, 0.25f, 0.85f};
+        c.ghostDensity = 0.55f;
+        c.ride = true;
+        c.snareRev = 0.3f;
+        c.bass = BassPat::LiquidSub;
+        c.bassP = {160, 250, 0.2f, 0.8f, 1.0f, 0, 1.3f, 0.45f, 0, false};
+        c.chordsDrop = ChordInstr::Rhodes;
+        c.chordsBreak = ChordInstr::Pad;
+        c.padUnderDrop = true;
+        c.pad = {6, 18, 2400, 0.8f, 0.8f, 1.5f, 0.075f};
+        c.leadBreak = c.leadDrop2 = true;
+        c.lead = LeadInstr::Rhodes;
+        c.prog = {0, 5, 2, 4};
+        c.sevenths = true;
+        c.chordCenter = 3;
+        c.scDepth = 0.25f;
+        c.scRelease = 0.1f;
+        c.dlyBeats = 1.5f;
+        c.revRoom = 0.88f;
+        c.dropBars = 32;
+        c.breakBars = 16;
+        break;
+    case SongStyle::Neurofunk:
+        c.drums = DrumPat::DnbRoll;
+        c.kick = {210, 52, 0.022f, 0.15f, 2.6f, 0.35f, 0.95f};
+        c.ghostDensity = 0.35f;
+        c.snarePitch = 1.35f;
+        c.bass = BassPat::Neuro;
+        c.growl = {90, 3200, 5.0f, 4.0f, 1.015f, 1.1f, 1.5f, 0.9f, 0.85f, 0.28f, false};
+        c.chordsDrop = ChordInstr::None;
+        c.chordsBreak = ChordInstr::Pad;
+        c.pad = {5, 25, 900, 1.2f, 1.5f, 1.5f, 0.08f};
+        c.prog = {0, 0, 5, 6};
+        c.chordCenter = 3;
+        c.scDepth = 0.3f;
+        c.scRelease = 0.08f;
+        c.dlyBeats = 0.75f;
+        c.dropBars = 32;
+        c.breakBars = 16;
+        break;
+    case SongStyle::JumpUp:
+        c.drums = DrumPat::DnbRoll;
+        c.kick = {200, 55, 0.025f, 0.18f, 2.2f, 0.3f, 1.0f};
+        c.ghostDensity = 0.15f;
+        c.bass = BassPat::Wobble;
+        c.growl = {120, 2200, 3.5f, 3.0f, 1.006f, 0.3f, 1.0f, 0.4f, 1.0f, 0.3f, false};
+        c.chordsDrop = ChordInstr::None;
+        c.chordsBreak = ChordInstr::Pad;
+        c.pad.cutoff = 2000;
+        c.leadBreak = true;
+        c.lead = LeadInstr::Square;
+        c.prog = {0, 0, 3, 4};
+        c.scDepth = 0.35f;
+        c.scRelease = 0.1f;
+        c.dropBars = 32;
+        c.breakBars = 16;
+        break;
+    case SongStyle::Jungle:
+        c.drums = DrumPat::Jungle;
+        c.kick = {160, 48, 0.035f, 0.22f, 1.8f, 0.2f, 0.95f};
+        c.snarePitch = 1.3f;
+        c.snareRev = 0.25f;
+        c.bass = BassPat::JungleSub;
+        c.bassP = {120, 150, 0.2f, 0.8f, 1.0f, 0, 2.2f, 0.48f, 0, false};
+        c.chordsDrop = ChordInstr::Stabs;
+        c.chordsBreak = ChordInstr::Pad;
+        c.stabStepsA = {0};
+        c.stabStepsB = {};
+        c.stabGate = 0.5f;
+        c.stab = {900, 5000, 0.12f, 0.35f, 2.0f, 0.12f, 0.6f, {0.4f, 0.45f}};
+        c.pad = {6, 20, 2000, 0.8f, 1.0f, 1.4f, 0.08f};
+        c.leadBreak = true;
+        c.lead = LeadInstr::Rhodes;
+        c.prog = {0, 5, 6, 4};
+        c.chordBars = 2;
+        c.chordCenter = 5;
+        c.scDepth = 0.25f;
+        c.dropBars = 32;
+        c.breakBars = 16;
+        break;
     }
     return c;
 }
@@ -353,6 +529,7 @@ struct Ctx {
     Rng rng;
     std::vector<AcidStep> acid[2];
     std::vector<MNote> motif;
+    int jungleVar = 0;
 
     Ctx(const SongSpec& s) : spec(s), st(makeStyle(s.style)), rng(s.seed) {}
 
@@ -741,6 +918,123 @@ void rhodes(Ctx& c, double beat, double lenBeats, int midi, float vel, float pan
     }
 }
 
+// Tuned percussion: rims, bongos and congas (pitch-dropping sine plus a click).
+void perc(Ctx& c, double beat, float vel, float hz, float dec, float pan, float noise) {
+    size_t s0 = c.at(beat);
+    if (s0 >= c.total) return;
+    size_t n = std::min(size_t(dec * 6.0f * kSr), c.total - s0);
+    Rng r(c.rng.next());
+    Svf bp;
+    bp.set(hz * 4.0f, 2.0f);
+    float ph = 0, e = 1, ne = 1, pe = 1;
+    const float ec = decayCoef(dec), nc = decayCoef(0.004f), pc = decayCoef(0.006f);
+    float gl, gr;
+    panGains(pan, gl, gr);
+    const float amp = vel * 0.32f;
+    for (size_t i = 0; i < n; ++i) {
+        ph += hz * (1.0f + 0.6f * pe) * kInvSr;
+        if (ph >= 1.0f) ph -= 1.0f;
+        pe *= pc;
+        float y = (fsin(ph) * e + bp.bp(r.bi()) * ne * noise) * amp;
+        e *= ec;
+        ne *= nc;
+        c.emit(c.drums, s0 + i, y * gl, y * gr, {0.12f, 0.12f});
+    }
+}
+
+// Additive "M1" style organ stab (drawbar sines with a percussive 3rd harmonic).
+void organ(Ctx& c, double beat, double lenBeats, int midi, float vel, float pan) {
+    size_t s0 = c.at(beat);
+    if (s0 >= c.total) return;
+    const size_t len = size_t(lenBeats * c.fpb), rel = size_t(0.07f * kSr);
+    size_t n = std::min(len + rel, c.total - s0);
+    static constexpr float harm[6] = {1, 2, 3, 4, 6, 8};
+    static constexpr float amps[6] = {1.0f, 0.55f, 0.0f, 0.4f, 0.2f, 0.12f};
+    const float f = midiHz(float(midi));
+    float ph[6] = {0, 0, 0, 0, 0, 0}, dt[6];
+    for (int h = 0; h < 6; ++h) dt[h] = std::min(0.45f, f * harm[h] * kInvSr);
+    float pe = 1, e = 1, aLen = 0;
+    const float pc = decayCoef(0.06f), ec = decayCoef(0.25f);
+    float gl, gr;
+    panGains(pan, gl, gr);
+    const float amp = vel * 0.075f;
+    for (size_t i = 0; i < n; ++i) {
+        float x = 0;
+        for (int h = 0; h < 6; ++h) {
+            float a = h == 2 ? 0.7f * pe : amps[h];
+            x += fsin(ph[h]) * a;
+            ph[h] += dt[h];
+            if (ph[h] >= 1.0f) ph[h] -= 1.0f;
+        }
+        pe *= pc;
+        float a;
+        if (i < len) {
+            a = std::min(1.0f, float(i) / 60.0f) * (0.55f + 0.45f * e);
+            aLen = a;
+        } else {
+            a = aLen * (1.0f - float(i - len) / float(rel));
+        }
+        e *= ec;
+        float y = ftanh(x * 0.8f) * a * amp;
+        c.emit(c.music, s0 + i, y * gl, y * gr, {0.2f, 0.25f});
+    }
+}
+
+// Growl / wobble bass: detuned FM saws through a modulated low-pass plus a
+// formant band-pass, then driven hard. The sine sub stays clean underneath.
+void growlNote(Ctx& c, double beat, double lenBeats, int midi, float vel, float lfoBeats) {
+    const GrowlP& g = c.st.growl;
+    size_t s0 = c.at(beat);
+    if (s0 >= c.total) return;
+    const size_t len = size_t(lenBeats * c.fpb), rel = size_t(0.015f * kSr), att = size_t(0.002f * kSr);
+    size_t n = std::min(len + rel, c.total - s0);
+    Rng r(c.rng.next());
+    const float dt = midiHz(float(midi)) * kInvSr;
+    Osc a, b, sub;
+    a.ph = r.uni();
+    b.ph = r.uni();
+    float mph = 0;
+    Svf fl, fr, bl, br, pl, pr;
+    pl.set(7000, 0.7f);
+    pr.set(7000, 0.7f);
+    float lfo = 0;
+    const float ratio = g.hi / g.lo;
+    for (size_t i = 0; i < n; ++i) {
+        if ((i & 7) == 0) {
+            if (g.perNote) {
+                float p = std::min(1.0f, float(i) / float(std::max<size_t>(1, len)));
+                lfo = std::sin(kPi * p);
+            } else {
+                double bpos = beat + double(i) / c.fpb;
+                lfo = 0.5f - 0.5f * std::cos(2.0f * kPi * float(std::fmod(bpos / lfoBeats, 1.0)));
+            }
+            float fc = g.lo * std::pow(ratio, lfo);
+            fl.set(fc, g.q);
+            fr.set(fc * 1.04f, g.q);
+            bl.set(fc * 2.2f, 4.0f);
+            br.set(fc * 2.3f, 4.0f);
+        }
+        float mod = g.fm > 0 ? fsin(mph) * g.fm * (0.3f + 0.7f * lfo) : 0.0f;
+        mph += dt * g.fmRatio;
+        if (mph >= 1.0f) mph -= 1.0f;
+        const float fmMul = std::max(0.2f, 1.0f + 0.5f * mod);
+        float x1 = a.saw(dt * g.detune * fmMul);
+        float x2 = b.saw(dt / g.detune * fmMul);
+        float inL = x1 + 0.6f * x2, inR = x2 + 0.6f * x1;
+        float yl = fl.lp(inL) + g.formant * bl.bp(inL);
+        float yr = fr.lp(inR) + g.formant * br.bp(inR);
+        yl = pl.lp(ftanh(yl * g.drive));
+        yr = pr.lp(ftanh(yr * g.drive));
+        float sb = sub.sine(dt) * g.sub;
+        float e;
+        if (i < att) e = float(i) / float(att);
+        else if (i < len) e = 1.0f;
+        else e = 1.0f - float(i - len) / float(rel);
+        float amp = e * vel * g.level;
+        c.emit(c.bass, s0 + i, (yl * 0.55f + sb) * amp, (yr * 0.55f + sb) * amp, {0.0f, 0.0f});
+    }
+}
+
 void leadNote(Ctx& c, double beat, double lenBeats, int midi, float vel) {
     if (c.st.lead == LeadInstr::Rhodes) {
         rhodes(c, beat, lenBeats, midi, vel * 1.1f, 0.1f, {0.3f, 0.35f});
@@ -988,6 +1282,76 @@ void scheduleDrums(Ctx& c, const Section& s) {
                     else hat(c, b, step % 4 == 0 ? 0.45f : 0.3f, false, 0.15f);
                 }
                 break;
+            case DrumPat::TechHouse:
+                if (kickOn && step % 4 == 0) kick(c, b, 1.0f);
+                if (snareOn && (step == 4 || step == 12)) clap(c, b, 1.0f);
+                if (fill && step == 15) clap(c, b, 0.5f);
+                if (hatsOn) {
+                    if (step % 4 == 2) {
+                        hat(c, b, openOn ? 0.85f : 0.75f, openOn, 0.15f);
+                    } else if (extraOn || s.kind == Sec::Build || (s.kind == Sec::Intro && second)) {
+                        float v = (step & 1) ? 0.3f + 0.15f * r.uni() : 0.18f;
+                        hat(c, b, v, false, (step & 1) ? -0.35f : 0.35f);
+                    }
+                }
+                if (st.perc && (drop || s.kind == Sec::Build)) {
+                    if (step == 3 || step == 11) perc(c, b, 0.55f, 1650.0f, 0.012f, -0.4f, 0.8f);
+                    if (odd && (step == 7 || step == 14)) perc(c, b, 0.5f, 330.0f, 0.08f, 0.45f, 0.15f);
+                    if (!odd && step == 9) perc(c, b, 0.45f, 225.0f, 0.1f, 0.5f, 0.1f);
+                }
+                break;
+            case DrumPat::TwoStep:
+                if (kickOn && (step == 0 || step == 10)) kick(c, b, step == 0 ? 1.0f : 0.85f);
+                if (snareOn && (step == 4 || step == 12)) {
+                    clap(c, b, 0.75f);
+                    snare(c, b, 0.5f, 1.1f);
+                }
+                if (fill && step == 15) snare(c, b, 0.3f, 1.2f);
+                if (hatsOn) {
+                    if (openOn && step == 14) hat(c, b, 0.6f, true, -0.1f);
+                    else if (step % 2 == 0) hat(c, b, step % 4 == 2 ? 0.7f : 0.4f, false, 0.15f);
+                    else if (extraOn || s.kind == Sec::Build) hat(c, b, 0.22f + 0.1f * r.uni(), false, -0.3f);
+                }
+                if (st.perc && drop) {
+                    if ((odd && (step == 7 || step == 15)) || (!odd && step == 3)) perc(c, b, 0.5f, 1900.0f, 0.01f, 0.35f, 0.9f);
+                    if (step == 9 && odd) perc(c, b, 0.35f, 280.0f, 0.07f, -0.45f, 0.1f);
+                }
+                break;
+            case DrumPat::DnbRoll:
+                if (kickOn && (step == 0 || step == 10)) kick(c, b, 1.0f);
+                if (kickOn && drop && odd && step == 13 && r.chance(0.5f)) kick(c, b, 0.6f);
+                if (snareOn && (step == 4 || step == 12)) snare(c, b, 1.0f, st.snarePitch);
+                if (drop && (step == 7 || step == 9 || step == 14) && r.chance(st.ghostDensity))
+                    snare(c, b, 0.16f + 0.12f * r.uni(), st.snarePitch);
+                if (hatsOn) {
+                    if (openOn && odd && step == 14) hat(c, b, 0.6f, true, -0.1f);
+                    else if (step % 2 == 0) hat(c, b, step % 4 == 0 ? 0.45f : 0.32f, false, 0.2f);
+                    else if (extraOn) hat(c, b, 0.14f + 0.1f * r.uni(), false, -0.25f);
+                    if (st.ride && (drop || openOn) && step % 4 == 0) hat(c, b, 0.3f, true, -0.35f);
+                }
+                break;
+            case DrumPat::Jungle: {
+                // Chopped "amen"-style bars: 0 kick, 1 snare, 2 ghost snare.
+                static const int pats[4][10][2] = {
+                    {{0, 0}, {2, 0}, {4, 1}, {7, 2}, {9, 2}, {10, 0}, {11, 0}, {12, 1}, {15, 2}, {-1, 0}},
+                    {{0, 0}, {2, 0}, {4, 1}, {7, 2}, {9, 2}, {10, 0}, {12, 1}, {14, 2}, {-1, 0}, {-1, 0}},
+                    {{0, 0}, {4, 1}, {6, 0}, {7, 2}, {10, 0}, {12, 1}, {13, 2}, {14, 1}, {15, 2}, {-1, 0}},
+                    {{0, 0}, {2, 0}, {4, 1}, {5, 2}, {8, 0}, {10, 1}, {11, 0}, {12, 1}, {14, 1}, {15, 2}},
+                };
+                if (step == 0) c.jungleVar = (rb % 4 == 3) ? 2 + r.range(2) : (odd ? 1 : 0);
+                for (const auto& h : pats[c.jungleVar]) {
+                    if (h[0] != step) continue;
+                    if (h[1] == 0 && kickOn) kick(c, b, step == 0 ? 1.0f : 0.8f);
+                    if (h[1] == 1 && snareOn) snare(c, b, 0.95f, st.snarePitch * (step == 14 ? 1.1f : 1.0f));
+                    if (h[1] == 2 && snareOn) snare(c, b, 0.3f, st.snarePitch * 1.05f);
+                }
+                if (hatsOn) {
+                    if (step % 2 == 0) hat(c, b, step % 4 == 0 ? 0.42f : 0.3f, false, 0.2f);
+                    else if (extraOn) hat(c, b, 0.18f + 0.1f * r.uni(), false, -0.25f);
+                    if (openOn && step == 6 && odd) hat(c, b, 0.5f, true, -0.2f);
+                }
+                break;
+            }
             }
         }
     }
@@ -1057,6 +1421,72 @@ void scheduleMusic(Ctx& c, const Section& s) {
                 break;
             case BassPat::Acid:
                 break;
+            case BassPat::TechRoll:
+                for (int step : {2, 3, 6, 7, 10, 11, 14}) {
+                    int note = bn;
+                    if (odd && step == 14) note = bassMidi(root, cd + 4);
+                    if (bar % 4 == 3 && step == 7) note += 12;
+                    bassNote(c, beatOf(st, bar, step), 0.2, note, step % 4 == 2 ? 1.0f : 0.7f);
+                }
+                break;
+            case BassPat::Disco: {
+                static const int dsteps[8][2] = {{0, 0}, {2, 12}, {3, 0}, {6, 12}, {8, 0}, {10, 12}, {11, 10}, {14, 12}};
+                for (const auto& d : dsteps) {
+                    int off = (odd && d[0] == 11) ? 7 : d[1];
+                    bassNote(c, beatOf(st, bar, d[0]), 0.18, bn + off, off ? 0.85f : 1.0f);
+                }
+                break;
+            }
+            case BassPat::Growl: {
+                static const int gsteps[6][2] = {{2, 2}, {5, 1}, {6, 2}, {10, 2}, {13, 1}, {14, 2}};
+                for (const auto& g : gsteps) {
+                    int note = bn + 12;
+                    if (odd && g[0] == 13) note += 12;
+                    if (odd && g[0] == 14) note = bassMidi(root, cd + 4) + 12;
+                    growlNote(c, beatOf(st, bar, g[0]), g[1] * 0.25 * 0.9, note, g[1] == 1 ? 0.85f : 1.0f, 0.5f);
+                }
+                break;
+            }
+            case BassPat::Garage: {
+                static const int gsteps[4][2] = {{0, 3}, {6, 2}, {10, 3}, {14, 2}};
+                for (const auto& g : gsteps) {
+                    int note = bn;
+                    if (odd && g[0] == 10) note += 12;
+                    if (odd && g[0] == 14) note = bassMidi(root, cd + 4);
+                    bassNote(c, beatOf(st, bar, g[0]), g[1] * 0.25, note, g[0] == 0 ? 1.0f : 0.85f);
+                }
+                break;
+            }
+            case BassPat::LiquidSub:
+                bassNote(c, b0, 2.4, bn, 1.0f);
+                bassNote(c, b0 + 2.5, 1.35, odd ? bassMidi(root, cd + 4) : bn, 0.9f);
+                break;
+            case BassPat::Neuro: {
+                static const double nb[5][2] = {{0, 1.25}, {1.5, 0.25}, {1.75, 0.5}, {2.5, 1.0}, {3.5, 0.4}};
+                static const int noff[5] = {0, 0, 12, 0, 7};
+                for (int k = 0; k < 5; ++k) {
+                    int note = bn + 12 + noff[k] + ((odd && k == 3) ? 3 : 0);
+                    growlNote(c, b0 + nb[k][0], nb[k][1], note, k == 0 ? 1.0f : 0.9f, odd ? 0.375f : 0.75f);
+                }
+                break;
+            }
+            case BassPat::Wobble: {
+                static const float lfoBeats[4] = {0.5f, 0.25f, 0.5f, 1.0f / 3.0f};
+                const float lb = lfoBeats[bar % 4];
+                growlNote(c, b0, 1.45, bn + 12, 1.0f, lb);
+                growlNote(c, b0 + 1.5, 0.45, bn + 24, 0.9f, lb);
+                growlNote(c, b0 + 2.0, 0.95, bn + 12, 1.0f, lb);
+                growlNote(c, b0 + 3.0, 0.95, bn + 12 + (odd ? 3 : -2), 0.95f, lb);
+                break;
+            }
+            case BassPat::JungleSub:
+                if (odd) {
+                    bassNote(c, b0, 1.75, bn, 1.0f);
+                    bassNote(c, b0 + 2.0, 1.9, bassMidi(root, cd + 4), 0.95f);
+                } else {
+                    bassNote(c, b0, 3.8, bn, 1.0f);
+                }
+                break;
             }
         }
 
@@ -1067,7 +1497,11 @@ void scheduleMusic(Ctx& c, const Section& s) {
                 padNote(c, bar * 4.0, lenBars * 4.0 - 0.05, m, cutMul);
         } else if (ci == ChordInstr::Stabs) {
             std::vector<int> steps;
-            if (st.drums == DrumPat::FourFloor && st.bass == BassPat::Rolling) {
+            const bool customSteps = !st.stabStepsA.empty() || !st.stabStepsB.empty();
+            const double gate = customSteps ? double(st.stabGate) : 0.3;
+            if (customSteps) {
+                steps = odd ? st.stabStepsB : st.stabStepsA;
+            } else if (st.drums == DrumPat::FourFloor && st.bass == BassPat::Rolling) {
                 steps = odd ? std::vector<int>{14} : std::vector<int>{6};  // sparse dub-techno stab
             } else {
                 steps = odd ? std::vector<int>{3, 6, 13} : std::vector<int>{3, 10};
@@ -1076,7 +1510,7 @@ void scheduleMusic(Ctx& c, const Section& s) {
             for (int step : steps) {
                 float pan = -0.2f;
                 for (int m : notes) {
-                    pluck(c, beatOf(st, bar, step), 0.3, m, 1.0f, pan, st.stab, cutMul);
+                    pluck(c, beatOf(st, bar, step), gate, m, 1.0f, pan, st.stab, cutMul);
                     pan += 0.4f / float(notes.size());
                 }
             }
@@ -1092,6 +1526,20 @@ void scheduleMusic(Ctx& c, const Section& s) {
             }
             // Bass note of the chord an octave below for body.
             rhodes(c, bar * 4.0, lenBars * 4.0 - 0.3, notes.front() - 12, 0.6f, 0.0f, {0.0f, 0.2f});
+        } else if (ci == ChordInstr::Organ) {
+            const auto notes = voiceChord(root, cd, st.sevenths, root + st.chordCenter);
+            for (int step : odd ? st.stabStepsB : st.stabStepsA) {
+                float pan = -0.25f;
+                for (int m : notes) {
+                    organ(c, beatOf(st, bar, step), st.stabGate, m, 0.9f, pan);
+                    pan += 0.5f / float(notes.size());
+                }
+            }
+        }
+        if (st.padUnderDrop && drop && chordStart && ci != ChordInstr::Pad) {
+            const int lenBars = std::min(st.chordBars, endBar - bar);
+            for (int m : voiceChord(root, cd, st.sevenths, root + st.chordCenter + 12))
+                padNote(c, bar * 4.0, lenBars * 4.0 - 0.05, m, 0.7f);
         }
 
         // Arp.
@@ -1223,6 +1671,14 @@ const std::vector<SongSpec>& stockSongs() {
         {"Lo-Fi Lagoon", "Sleepy Cassette", "Lo-Fi Hip Hop", "C min", 88.0, 60, 0x10F1u, SongStyle::LoFi},
         {"Acid Rain", "The 303 Collective", "Acid Techno", "C# min", 130.0, 61, 0xAC1Du, SongStyle::AcidTechno},
         {"Cloud Nine", "Stratos & Friends", "Progressive House", "B min", 126.0, 59, 0xC10D9u, SongStyle::ProgHouse},
+        {"Warehouse Shuffle", "Concrete Groove", "Tech House", "E min", 126.0, 52, 0x7EC4u, SongStyle::TechHouse},
+        {"Mirrorball Motel", "Funk Voyager", "Disco House", "F min", 124.0, 53, 0xD15C0u, SongStyle::DiscoHouse},
+        {"Subwoofer Sermon", "Wub Cartel", "Bass House", "F# min", 128.0, 54, 0xBA55u, SongStyle::BassHouse},
+        {"Night Bus Home", "Skippy Delgado", "UK Garage", "Bb min", 132.0, 58, 0x2573Eu, SongStyle::UkGarage},
+        {"Rainfall Theory", "Soft Circuits", "Liquid DnB", "D min", 172.0, 62, 0x11C1Du, SongStyle::LiquidDnb},
+        {"Chrome Mandible", "Neural Gremlin", "Neurofunk", "F min", 174.0, 53, 0x2E60u, SongStyle::Neurofunk},
+        {"Bounce Protocol", "MC Trampoline", "Jump-Up DnB", "G min", 175.0, 55, 0x1BA7u, SongStyle::JumpUp},
+        {"Rewind Selecta", "Dubplate Ghosts", "Jungle", "A min", 168.0, 57, 0x7A6Eu, SongStyle::Jungle},
     };
     return songs;
 }

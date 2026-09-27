@@ -1,0 +1,25 @@
+name: Build Afterglow
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libxcursor-dev libgl1-mesa-dev libasound2-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build --config Release --parallel
+      - run: ctest --test-dir build -C Release --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: afterglow-${{ matrix.os }}
+          path: |
+            build/Afterglow.app
+            build/Release/Afterglow.exe
+            build/Afterglow
+            assets/Roboto-LICENSE.txt

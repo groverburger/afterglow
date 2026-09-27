@@ -79,6 +79,7 @@ struct TransitionRun {
     bool inStarted = false;
     bool fxFired = false;
     bool synced = false;
+    bool land = false;        // in deck's position is where the blend should END
     float progress = 0;
 };
 
@@ -124,14 +125,20 @@ public:
     void startMotion(int d, Motion m);
     // Matches tempo to the other deck. Returns false (and sets `why`) if impossible.
     bool syncTempo(int d, std::string* why);
-    void alignPhase(int d, double masterBeat, double fold);
+    // Shifts deck d onto the master's beat. barAlign also matches the position in the bar
+    // (up to +/-2 beats); otherwise only the sub-beat phase is corrected.
+    void alignPhase(int d, double masterBeat, double fold, bool barAlign = true);
     bool deckAudible(int d) const;
     int otherDeck(int d) const { return 1 - d; }
     float xfGain(int d) const;
     void resetAllFx();
 
     // Transitions. Returns false (and sets `why`) if the transition can't start.
-    bool startTransition(const TransitionDef& def, int outDeck, std::string* why);
+    // With `land`, the incoming deck's current position is where it will be when the
+    // blend finishes: it is rewound by the blend length before it starts playing.
+    bool startTransition(const TransitionDef& def, int outDeck, std::string* why, bool land = false);
+    // Frames the incoming deck will play during `def` (the landing rewind distance).
+    double landingPreRoll(const TransitionDef& def, int inDeck) const;
     void cancelTransition();
     bool transitionBusy() const { return run.state != TransitionRun::State::Idle; }
     bool paramAutomated(int deck, int which) const;  // which: 0 vol,1 low,2 mid,3 high,4 filter,5 echo

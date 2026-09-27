@@ -12,7 +12,7 @@
 namespace {
 
 // One-pole low-pass coefficient for a cutoff frequency.
-float onePoleCoef(float hz) { return 1.0f - std::exp(-2.0f * float(M_PI) * hz / kSampleRate); }
+float onePoleCoef(float hz) { return 1.0f - std::exp(-2.0f * 3.14159265f * hz / kSampleRate); }
 
 std::string lowerExt(const std::string& path) {
     auto dot = path.find_last_of('.');

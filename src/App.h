@@ -45,6 +45,7 @@ struct App {
     Visualizer vis;
     std::vector<TransitionDef> transitions;  // stock first, then custom
     int selectedTransition = 1;
+    bool landOnCue = false;  // incoming deck's cue marks where the blend ENDS instead of starts
 
     int pendingLoad[2] = {-1, -1};  // library entry waiting to be loaded
     int deckEntry[2] = {-1, -1};    // library entry currently on each deck
@@ -61,13 +62,13 @@ struct App {
     int autoDjPlayed = 0;
     bool partyMode = false;
     bool showHelp = true;
-    bool showDemo = false;
     int bottomTab = 0;
     int requestTab = -1;
     char search[128] = "";
     float dt = 1.0f / 60.0f;
     float time = 0;
-    std::string userDir = "user_data";
+    std::string userDir;  // per-user data folder, set in init()
+    std::string musicDir() const { return userDir + "/music"; }
     ImFont* fontUi = nullptr;
     ImFont* fontBig = nullptr;
 
@@ -83,7 +84,9 @@ struct App {
     int smartTargetDeck() const;            // the deck a "load" should go to
     int liveDeck() const;                   // deck currently driving the mix, -1 if none
     int transitionOutDeck() const;
-    void triggerTransition();
+    void triggerTransition(bool allowLanding = true);
+    // Deck that MIX would bring in, and whether a landing overlay should be shown on it.
+    bool landingPreview(int deck, double* startFrame) const;
     void saveCustomTransitions();
     int nextAutoDjEntry();
     // Adds a clip to the library and saves it to disk.

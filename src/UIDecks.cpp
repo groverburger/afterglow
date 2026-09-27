@@ -69,6 +69,26 @@ void drawMarkers(ImDrawList* dl, const Deck& dk, ImVec2 p0, ImVec2 p1, double fr
     }
 }
 
+// Shows where a landing-mode blend will start and where it lands (the cue).
+void drawLanding(ImDrawList* dl, const Deck& dk, ImVec2 p0, ImVec2 p1, double frameStart, double fpp, double startFrame,
+                 bool labels) {
+    auto xOf = [&](double f) { return p0.x + float((f - frameStart) / fpp); };
+    float xs = xOf(startFrame), xe = xOf(dk.pos);
+    float a = std::max(p0.x, xs), b = std::min(p1.x, xe);
+    const ImU32 col = IM_COL32(255, 200, 60, 255);
+    if (b > a) dl->AddRectFilledMultiColor(ImVec2(a, p0.y), ImVec2(b, p1.y), ui::withAlpha(col, 0.05f),
+                                           ui::withAlpha(col, 0.28f), ui::withAlpha(col, 0.28f), ui::withAlpha(col, 0.05f));
+    if (xs >= p0.x && xs <= p1.x) {
+        dl->AddLine(ImVec2(xs, p0.y), ImVec2(xs, p1.y), ui::withAlpha(col, 0.8f), 1.5f);
+        if (labels) dl->AddText(ImVec2(xs + 4, p1.y - 16), col, "blend starts");
+    }
+    if (xe >= p0.x && xe <= p1.x) {
+        dl->AddLine(ImVec2(xe, p0.y), ImVec2(xe, p1.y), col, 2.5f);
+        dl->AddTriangleFilled(ImVec2(xe, p0.y), ImVec2(xe + 12, p0.y + 6), ImVec2(xe, p0.y + 12), col);
+        if (labels) dl->AddText(ImVec2(xe + 4, p0.y + 13), col, "lands here");
+    }
+}
+
 }  // namespace
 
 // --------------------------------------------------------- waveforms ----
@@ -126,6 +146,8 @@ void App::drawWaveforms(ImVec2 pos, ImVec2 size) {
         drawBeatGrid(dl, dk, w0, w1, frameStart, fpp, true);
         ui::DrawWaveform(dl, *dk.track, ImVec2(w0.x, w0.y + 2), ImVec2(w1.x, w1.y - 2), frameStart, fpp);
         drawMarkers(dl, dk, w0, w1, frameStart, fpp);
+        double landStart;
+        if (landingPreview(d, &landStart)) drawLanding(dl, dk, w0, w1, frameStart, fpp, landStart, true);
         // Dim the part that has already played.
         dl->AddRectFilled(w0, ImVec2(w0.x + width * 0.5f, w1.y), IM_COL32(0, 0, 0, 70));
         float cx = w0.x + width * 0.5f;
@@ -243,6 +265,8 @@ void App::drawDeck(int d, ImVec2 pos, ImVec2 size) {
         dl->AddRectFilled(p0, p1, IM_COL32(12, 12, 18, 255), 3.0f);
         ui::DrawWaveform(dl, *dk.track, p0, p1, 0.0, fpp, 0.9f);
         drawMarkers(dl, dk, p0, p1, 0.0, fpp);
+        double landStart;
+        if (landingPreview(d, &landStart)) drawLanding(dl, dk, p0, p1, 0.0, fpp, landStart, false);
         float px = p0.x + float(dk.pos / fpp);
         dl->AddRectFilled(p0, ImVec2(px, p1.y), IM_COL32(0, 0, 0, 110));
         dl->AddLine(ImVec2(px, p0.y), ImVec2(px, p1.y), IM_COL32(255, 255, 255, 255), 2.0f);
@@ -526,6 +550,22 @@ void App::drawTransitionBar(ImVec2 pos, ImVec2 size) {
     }
     ImGui::SameLine(0, 18);
 
+    // What the incoming deck's playhead means: where the blend starts, or where it lands.
+    {
+        ImGui::BeginGroup();
+        ImGui::TextDisabled("PLAYHEAD OF %c MARKS", 'A' + in);
+        const ImU32 c = IM_COL32(255, 200, 60, 255);
+        if (ui::ColoredButton("Start##cue", c, ImVec2(62, 0), !landOnCue)) landOnCue = false;
+        ui::Tip("The incoming track starts playing from its playhead when the blend begins.");
+        ImGui::SameLine(0, 2);
+        if (ui::ColoredButton("Landing##cue", c, ImVec2(72, 0), landOnCue)) landOnCue = true;
+        ui::Tip("The incoming track ARRIVES at its playhead when the blend finishes.\n"
+                "Put the playhead on the drop and it lands right as the old track is gone - "
+                "the yellow zone on its waveform shows where the blend will begin.");
+        ImGui::EndGroup();
+    }
+    ImGui::SameLine(0, 18);
+
     // The big button.
     {
         char lbl[64];
@@ -545,7 +585,7 @@ void App::drawTransitionBar(ImVec2 pos, ImVec2 size) {
 
     // Progress / status.
     ImGui::BeginGroup();
-    const float progW = std::max(160.0f, ImGui::GetContentRegionAvail().x - 430);
+    const float progW = std::max(140.0f, ImGui::GetContentRegionAvail().x - 430);
     if (engine.run.state == TransitionRun::State::Armed) {
         ImGui::TextColored(ImVec4(1, 0.85f, 0.3f, 1), "Waiting for the next bar to start \"%s\"...", engine.run.def.name.c_str());
         float pulse = 0.5f + 0.5f * std::sin(time * 8.0f);
