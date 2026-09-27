@@ -1,0 +1,63 @@
+// Transition definitions: automation lanes that move mixer controls over time.
+#pragma once
+#include <array>
+#include <string>
+#include <vector>
+
+// Every automatable control. "Out" is the deck being mixed out, "In" is the
+// deck being mixed in. All values are normalised 0..1:
+//   Crossfader: 0 = fully Out, 1 = fully In
+//   Volume / Echo: 0..1
+//   Filter / EQ: 0.5 = neutral (filter: 0 low-pass, 1 high-pass; EQ: 0 = kill)
+enum class Param {
+    Crossfader,
+    OutVolume, InVolume,
+    OutLow, InLow,
+    OutMid, InMid,
+    OutHigh, InHigh,
+    OutFilter, InFilter,
+    OutEcho, InEcho,
+    Count
+};
+constexpr int kNumParams = int(Param::Count);
+
+const char* paramName(Param p);
+const char* paramId(Param p);  // stable identifier for save files
+float paramNeutral(Param p);
+
+enum class CurveShape { Linear, Smooth, Step };
+
+struct Keyframe {
+    float t = 0;  // 0..1 through the transition
+    float v = 0;  // normalised value
+    CurveShape shape = CurveShape::Smooth;  // shape of the segment after this key
+};
+
+struct Lane {
+    bool enabled = false;
+    std::vector<Keyframe> keys;  // sorted by t
+    float eval(float t) const;
+    void sortKeys();
+};
+
+enum class OutEffect { None, Brake, Backspin };
+
+struct TransitionDef {
+    std::string name;
+    std::string description;
+    bool stock = false;
+    int beats = 16;            // length, in beats of the outgoing track
+    float inStartAt = 0.0f;    // when (0..1) the incoming deck starts playing
+    OutEffect outEffect = OutEffect::None;
+    float outEffectAt = 0.0f;  // when (0..1) the out effect fires
+    std::array<Lane, kNumParams> lanes;
+
+    Lane& lane(Param p) { return lanes[size_t(p)]; }
+    const Lane& lane(Param p) const { return lanes[size_t(p)]; }
+};
+
+std::vector<TransitionDef> makeStockTransitions();
+
+// Plain-text persistence for custom transitions.
+bool saveTransitions(const std::string& path, const std::vector<TransitionDef>& defs);
+std::vector<TransitionDef> loadTransitions(const std::string& path);

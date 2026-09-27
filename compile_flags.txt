@@ -1,0 +1,7 @@
+-xc++
+-std=c++17
+-Ithird_party/sokol
+-Ithird_party/sokol/util
+-Ithird_party/imgui
+-Ithird_party/dr_libs
+-Isrc

@@ -1,0 +1,689 @@
+// Dummy DJ Set: entry point, sokol callbacks, frame layout and app logic.
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <random>
+
+#include "App.h"
+#include "imgui.h"
+#include "sokol_app.h"
+#include "sokol_audio.h"
+#include "sokol_gfx.h"
+#include "sokol_glue.h"
+#include "sokol_imgui.h"
+#include "sokol_log.h"
+
+namespace fs = std::filesystem;
+
+static App* g_app = nullptr;
+
+// ------------------------------------------------------------- helpers ----
+
+std::string formatTime(double sec) {
+    sec = std::max(0.0, sec);
+    int m = int(sec / 60.0);
+    double s = sec - m * 60.0;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d:%04.1f", m, s);
+    return buf;
+}
+
+static int camelot(const std::string& key, bool* minor) {
+    // Returns 1..12 or 0 if unknown.
+    std::string k = key;
+    auto sp = k.find(' ');
+    if (sp == std::string::npos) return 0;
+    std::string note = k.substr(0, sp), mode = k.substr(sp + 1);
+    *minor = mode.rfind("min", 0) == 0;
+    static const char* names[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+    static const char* flats[12] = {"C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"};
+    int pc = -1;
+    for (int i = 0; i < 12; ++i)
+        if (note == names[i] || note == flats[i]) pc = i;
+    if (pc < 0) return 0;
+    // Camelot numbers per pitch class.
+    static const int minorNum[12] = {5, 12, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10};
+    static const int majorNum[12] = {8, 3, 10, 5, 12, 7, 2, 9, 4, 11, 6, 1};
+    return *minor ? minorNum[pc] : majorNum[pc];
+}
+
+bool keysCompatible(const std::string& a, const std::string& b) {
+    bool ma, mb;
+    int ca = camelot(a, &ma), cb = camelot(b, &mb);
+    if (!ca || !cb) return false;
+    if (ca == cb) return true;
+    int d = std::abs(ca - cb);
+    return ma == mb && (d == 1 || d == 11);
+}
+
+bool beginPanel(const char* name, ImVec2 pos, ImVec2 size, bool scroll) {
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    ImGuiWindowFlags f = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                         ImGuiWindowFlags_NoSavedSettings;
+    if (!scroll) f |= ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    return ImGui::Begin(name, nullptr, f);
+}
+
+void App::toast(const std::string& text, ImU32 color) {
+    if (!toasts.empty() && toasts.back().text == text) {
+        toasts.back().time = 4.0f;
+        return;
+    }
+    toasts.push_back({text, 4.0f, color});
+    if (toasts.size() > 5) toasts.erase(toasts.begin());
+}
+
+int App::liveDeck() const {
+    bool a = engine.deckAudible(0), b = engine.deckAudible(1);
+    if (a && !b) return 0;
+    if (b && !a) return 1;
+    if (a && b) return engine.crossfader < 0.5f ? 0 : 1;
+    if (engine.decks[0].playing) return 0;
+    if (engine.decks[1].playing) return 1;
+    return -1;
+}
+
+int App::transitionOutDeck() const {
+    int live = liveDeck();
+    if (live >= 0) return live;
+    // Nothing playing: "transition" means start whichever loaded deck the crossfader isn't on.
+    bool a = engine.decks[0].loaded(), b = engine.decks[1].loaded();
+    if (a && !b) return 1;
+    if (b && !a) return 0;
+    return engine.crossfader < 0.5f ? 1 : 0;
+}
+
+int App::smartTargetDeck() const {
+    for (int d = 0; d < 2; ++d)
+        if (!engine.decks[d].loaded() && pendingLoad[d] < 0) return d;
+    int live = liveDeck();
+    if (live >= 0) return 1 - live;
+    return engine.crossfader < 0.5f ? 1 : 0;
+}
+
+void App::requestLoad(int deck, int entry) {
+    const TransitionRun& run = engine.run;
+    if (engine.transitionBusy() && (run.in == deck || run.out == deck)) {
+        toast("Wait for the transition to finish before loading that deck", ui::theme.warn);
+        return;
+    }
+    if (engine.deckAudible(deck)) {
+        confirmDeck = deck;
+        confirmEntry = entry;
+        return;
+    }
+    pendingLoad[deck] = entry;
+    library.request(entry, true);
+}
+
+void App::triggerTransition() {
+    if (selectedTransition < 0 || selectedTransition >= int(transitions.size())) selectedTransition = 0;
+    const TransitionDef& def = transitions[size_t(selectedTransition)];
+    int out = transitionOutDeck();
+    int in = 1 - out;
+    Deck& inDk = engine.decks[in];
+    if (inDk.loaded() && !inDk.playing && inDk.remainingSec() < 30.0) {
+        inDk.pos = inDk.cuePoint;
+        toast(std::string("Deck ") + char('A' + in) + " was near its end - rewound to the cue point");
+    }
+    std::string why;
+    if (!engine.startTransition(def, out, &why)) {
+        toast(why, ui::theme.warn);
+        return;
+    }
+    const Deck& o = engine.decks[out];
+    if (o.playing && o.loaded()) {
+        double need = def.beats * o.secPerBeat() / std::max(0.25, o.rate());
+        if (o.remainingSec() < need)
+            toast("Heads up: the outgoing track ends before this transition does", IM_COL32(255, 210, 60, 255));
+    }
+}
+
+void App::saveCustomTransitions() {
+    std::error_code ec;
+    fs::create_directories(userDir, ec);
+    if (!saveTransitions(userDir + "/transitions.txt", transitions)) toast("Could not save transitions", ui::theme.warn);
+}
+
+// ----------------------------------------------------------- lifecycle ----
+
+void App::init() {
+    std::error_code ec;
+    fs::create_directories(userDir, ec);
+    library.init("music", userDir + "/clips");
+
+    transitions = makeStockTransitions();
+    for (auto& t : loadTransitions(userDir + "/transitions.txt")) transitions.push_back(t);
+    if (fs::exists(userDir + "/seen_help")) showHelp = false;
+
+    vis.init();
+    // Ready to play on first launch: two key-compatible tracks.
+    requestLoad(0, 0);
+    requestLoad(1, 2);
+    engine.crossfader = 0.0f;
+}
+
+void App::shutdown() { vis.shutdown(); }
+
+void App::onFilesDropped(const std::vector<std::string>& paths) {
+    int added = 0;
+    for (auto& p : paths) {
+        if (!isAudioFile(p)) {
+            toast("Skipped " + fs::path(p).filename().string() + " (only WAV, MP3 and FLAC work)", ui::theme.warn);
+            continue;
+        }
+        library.addFile(p);
+        ++added;
+    }
+    if (added) {
+        toast("Importing " + std::to_string(added) + " file(s) - they'll appear in the Library", ui::theme.good);
+        requestTab = 0;
+    }
+}
+
+void App::processPendingLoads() {
+    for (int d = 0; d < 2; ++d) {
+        int idx = pendingLoad[d];
+        if (idx < 0) continue;
+        LibraryEntry* e = library.entry(idx);
+        if (!e) {
+            pendingLoad[d] = -1;
+            continue;
+        }
+        if (e->state == EntryState::Failed) {
+            toast("Couldn't load " + e->name + ": " + e->error, ui::theme.warn);
+            pendingLoad[d] = -1;
+        } else if (e->state == EntryState::Ready) {
+            TrackPtr t = library.acquire(idx);
+            if (engine.deckAudible(d)) continue;  // became live meanwhile; wait
+            engine.loadTrack(d, t);
+            deckEntry[d] = idx;
+            pendingLoad[d] = -1;
+        }
+    }
+}
+
+int App::nextAutoDjEntry() {
+    const int n = library.size();
+    if (n == 0) return -1;
+    int live = liveDeck();
+    int cur = live >= 0 ? deckEntry[live] : deckEntry[0];
+    if (autoDjOrder == AutoDjOrder::Shuffle) {
+        static std::mt19937 rng(1234);
+        for (int tries = 0; tries < 20; ++tries) {
+            int i = int(rng() % unsigned(n));
+            if (i != cur && i != deckEntry[0] && i != deckEntry[1] && library.entry(i)->state != EntryState::Failed) return i;
+        }
+    }
+    if (autoDjOrder == AutoDjOrder::ByTempo && cur >= 0) {
+        // Closest tempo to what's playing, preferring compatible keys.
+        LibraryEntry* c = library.entry(cur);
+        int best = -1;
+        double bestScore = 1e9;
+        for (int i = 0; i < n; ++i) {
+            LibraryEntry* e = library.entry(i);
+            if (i == deckEntry[0] || i == deckEntry[1] || e->bpm <= 0 || e->state == EntryState::Failed) continue;
+            double score = std::fabs(std::log(e->bpm / c->bpm)) * 100.0 - (keysCompatible(e->key, c->key) ? 2.0 : 0.0);
+            if (score < bestScore) {
+                bestScore = score;
+                best = i;
+            }
+        }
+        if (best >= 0) return best;
+    }
+    for (int k = 1; k <= n; ++k) {
+        int i = ((cur < 0 ? -1 : cur) + k) % n;
+        if (i != deckEntry[0] && i != deckEntry[1] && library.entry(i)->state != EntryState::Failed) return i;
+    }
+    return -1;
+}
+
+void App::updateAutoDj() {
+    if (!autoDj) return;
+    int live = liveDeck();
+    if (live < 0) {
+        // Kick things off with whatever is loaded.
+        if (!engine.transitionBusy() && (engine.decks[0].loaded() || engine.decks[1].loaded())) {
+            int d = engine.decks[0].loaded() ? 0 : 1;
+            engine.crossfader = d == 0 ? 0.0f : 1.0f;
+            engine.play(d);
+        }
+        return;
+    }
+    int other = 1 - live;
+    Deck& o = engine.decks[other];
+    if (engine.transitionBusy()) return;
+    if ((!o.loaded() || o.playing || deckEntry[other] == deckEntry[live]) && pendingLoad[other] < 0) {
+        int next = nextAutoDjEntry();
+        if (next >= 0) {
+            pendingLoad[other] = next;
+            library.request(next, true);
+        }
+        return;
+    }
+    if (!o.loaded() || pendingLoad[other] >= 0) return;
+    const Deck& l = engine.decks[live];
+    if (autoDjRandomTransition && engine.run.state == TransitionRun::State::Idle) {
+        // Choose the next transition once, early.
+        static int lastPick = -1;
+        if (lastPick != deckEntry[other]) {
+            lastPick = deckEntry[other];
+            selectedTransition = int(std::rand() % int(transitions.size()));
+        }
+    }
+    const TransitionDef& def = transitions[size_t(std::clamp(selectedTransition, 0, int(transitions.size()) - 1))];
+    double spb = l.secPerBeat() / std::max(0.25, l.rate());
+    double need = (def.beats + 6) * spb;
+    if (l.remainingSec() <= need) {
+        triggerTransition();
+        ++autoDjPlayed;
+    }
+}
+
+void App::handleShortcuts() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.WantTextInput || ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId)) return;
+    if (ImGui::IsKeyPressed(ImGuiKey_Q, false)) engine.togglePlay(0);
+    if (ImGui::IsKeyPressed(ImGuiKey_P, false)) engine.togglePlay(1);
+    if (ImGui::IsKeyPressed(ImGuiKey_T, false)) triggerTransition();
+    if (ImGui::IsKeyPressed(ImGuiKey_F, false)) partyMode = !partyMode;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) partyMode = false;
+    if (ImGui::IsKeyPressed(ImGuiKey_H, false)) showHelp = !showHelp;
+    if (ImGui::IsKeyPressed(ImGuiKey_V, false)) vis.mode = (vis.mode + 1) % Visualizer::NumModes;
+}
+
+void App::drawToasts() {
+    ImVec2 ds = ImGui::GetIO().DisplaySize;
+    float y = ds.y - 20.0f;
+    for (int i = int(toasts.size()) - 1; i >= 0; --i) {
+        Toast& t = toasts[size_t(i)];
+        t.time -= dt;
+        float a = std::clamp(t.time, 0.0f, 1.0f);
+        ImVec2 ts = ImGui::CalcTextSize(t.text.c_str());
+        ImVec2 p1(ds.x * 0.5f + ts.x * 0.5f + 16, y), p0(ds.x * 0.5f - ts.x * 0.5f - 16, y - ts.y - 14);
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        dl->AddRectFilled(p0, p1, IM_COL32(20, 20, 30, int(230 * a)), 8.0f);
+        dl->AddRect(p0, p1, ui::withAlpha(t.color, a), 8.0f, 0, 1.5f);
+        dl->AddText(ImVec2(p0.x + 16, p0.y + 7), ui::withAlpha(t.color, a), t.text.c_str());
+        y = p0.y - 6;
+    }
+    toasts.erase(std::remove_if(toasts.begin(), toasts.end(), [](const Toast& t) { return t.time <= 0; }), toasts.end());
+}
+
+void App::drawConfirmModal() {
+    if (confirmDeck >= 0 && !ImGui::IsPopupOpen("Deck is live!")) ImGui::OpenPopup("Deck is live!");
+    ImVec2 ds = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Deck is live!", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        LibraryEntry* e = library.entry(confirmEntry);
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Deck %c is playing out loud right now.", 'A' + confirmDeck);
+        ImGui::Text("Loading \"%s\" would stop the music your audience hears.", e ? e->name.c_str() : "?");
+        ImGui::Spacing();
+        int other = 1 - confirmDeck;
+        bool otherFree = !engine.deckAudible(other) && !(engine.transitionBusy());
+        if (otherFree) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "Load into deck %c instead", 'A' + other);
+            if (ui::ColoredButton(buf, ui::theme.good, ImVec2(0, 32), true)) {
+                pendingLoad[other] = confirmEntry;
+                library.request(confirmEntry, true);
+                confirmDeck = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+        }
+        if (ui::ColoredButton("Stop it and load anyway", ui::theme.warn, ImVec2(0, 32))) {
+            engine.pause(confirmDeck);
+            pendingLoad[confirmDeck] = confirmEntry;
+            library.request(confirmEntry, true);
+            confirmDeck = -1;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(0, 32)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            confirmDeck = -1;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void App::drawMenuBar(float& height) {
+    height = 0;
+    if (!ImGui::BeginMainMenuBar()) return;
+    ImGui::TextColored(ImVec4(0.3f, 0.85f, 1, 1), "DUMMY");
+    ImGui::SameLine(0, 2);
+    ImGui::TextColored(ImVec4(1, 0.35f, 0.7f, 1), "DJ");
+    ImGui::SameLine();
+    if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("Open music folder location")) {
+            std::error_code ec;
+            toast("Put WAV/MP3/FLAC files in: " + fs::absolute("music", ec).string());
+        }
+        if (ImGui::MenuItem("Open clips folder location")) {
+            std::error_code ec;
+            toast("Your clips are saved in: " + fs::absolute(library.clipDir(), ec).string());
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Quit", "Cmd+Q")) sapp_request_quit();
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("View")) {
+        ImGui::MenuItem("Party mode (fullscreen visuals)", "F", &partyMode);
+        if (ImGui::BeginMenu("Visualizer")) {
+            for (int m = 0; m < Visualizer::NumModes; ++m)
+                if (ImGui::MenuItem(Visualizer::modeName(m), nullptr, vis.mode == m)) vis.mode = m;
+            ImGui::Separator();
+            ImGui::MenuItem("Auto-cycle modes", nullptr, &vis.autoCycle);
+            ImGui::EndMenu();
+        }
+        ImGui::MenuItem("ImGui demo window", nullptr, &showDemo);
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Help")) {
+        ImGui::MenuItem("Quick start guide", "H", &showHelp);
+        ImGui::EndMenu();
+    }
+    // Status on the right.
+    char buf[160];
+    int live = liveDeck();
+    if (live >= 0) {
+        const Deck& d = engine.decks[live];
+        std::snprintf(buf, sizeof(buf), "ON AIR: %s  |  %.1f BPM", d.track ? d.track->name.c_str() : "-", d.effectiveBpm());
+    } else {
+        std::snprintf(buf, sizeof(buf), "Silence - press PLAY on a deck (or Q / P)");
+    }
+    float w = ImGui::CalcTextSize(buf).x;
+    ImGui::SameLine(ImGui::GetWindowWidth() - w - 20);
+    ImGui::TextColored(live >= 0 ? ImVec4(1, 0.4f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.7f, 1), "%s", buf);
+    height = ImGui::GetWindowSize().y;
+    ImGui::EndMainMenuBar();
+}
+
+void App::drawParty() {
+    ImVec2 ds = ImGui::GetIO().DisplaySize;
+    ImDrawList* bg = ImGui::GetBackgroundDrawList();
+    vis.draw(bg, ImVec2(0, 0), ds, vis.mode);
+
+    int live = liveDeck();
+    ImDrawList* fg = ImGui::GetForegroundDrawList();
+    if (live >= 0 && engine.decks[live].track) {
+        const Deck& d = engine.decks[live];
+        char big[256];
+        std::snprintf(big, sizeof(big), "%s", d.track->name.c_str());
+        float size = std::min(64.0f, ds.x / 18.0f);
+        ImFont* f = fontBig ? fontBig : ImGui::GetFont();
+        ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0, big);
+        fg->AddText(f, size, ImVec2(40 + 3, ds.y - ts.y * 2.2f + 3), IM_COL32(0, 0, 0, 160), big);
+        fg->AddText(f, size, ImVec2(40, ds.y - ts.y * 2.2f), IM_COL32(255, 255, 255, 235), big);
+        char sub[160];
+        std::snprintf(sub, sizeof(sub), "%s   -   %.1f BPM   -   %s left", d.track->artist.c_str(), d.effectiveBpm(),
+                      formatTime(d.remainingSec()).c_str());
+        fg->AddText(f, size * 0.4f, ImVec2(42, ds.y - ts.y * 1.1f), ui::withAlpha(ui::theme.deck[live], 0.9f), sub);
+    }
+    // Small control strip so the set can continue from party mode.
+    ImGui::SetNextWindowPos(ImVec2(ds.x - 16, 16), ImGuiCond_Always, ImVec2(1, 0));
+    ImGui::SetNextWindowBgAlpha(0.45f);
+    ImGui::Begin("##party", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoMove);
+    if (ImGui::Button("Exit party mode (Esc)")) partyMode = false;
+    ImGui::SameLine();
+    if (ImGui::Button("Next visual (V)")) vis.mode = (vis.mode + 1) % Visualizer::NumModes;
+    ImGui::SameLine();
+    {
+        bool busy = engine.transitionBusy();
+        ImGui::BeginDisabled(busy);
+        char lbl[96];
+        std::snprintf(lbl, sizeof(lbl), "MIX NEXT (%s)", transitions[size_t(selectedTransition)].name.c_str());
+        if (ui::ColoredButton(lbl, ui::theme.good, ImVec2(0, 0), true)) triggerTransition();
+        ImGui::EndDisabled();
+        if (busy) {
+            ImGui::SameLine();
+            ImGui::ProgressBar(engine.run.progress, ImVec2(120, 0));
+        }
+    }
+    ImGui::Checkbox("Auto DJ", &autoDj);
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto-cycle visuals", &vis.autoCycle);
+    ImGui::End();
+}
+
+void App::frame() {
+    dt = float(sapp_frame_duration());
+    time += dt;
+    simgui_frame_desc_t fd{};
+    fd.width = sapp_width();
+    fd.height = sapp_height();
+    fd.delta_time = sapp_frame_duration();
+    fd.dpi_scale = sapp_dpi_scale();
+    simgui_new_frame(&fd);
+
+    // The UI owns the engine for the duration of the UI build (a few ms).
+    std::unique_lock<std::mutex> lock(engine.mutex);
+    processPendingLoads();
+    vis.update(engine, dt);
+    handleShortcuts();
+    {
+        updateAutoDj();
+        for (int d = 0; d < 2; ++d) {
+            deckMeters[d].push(engine.decks[d].meter, dt);
+            engine.decks[d].meter = 0;
+        }
+        masterMeters[0].push(engine.masterMeter[0], dt);
+        masterMeters[1].push(engine.masterMeter[1], dt);
+        engine.masterMeter[0] = engine.masterMeter[1] = 0;
+        limiterLight = engine.limiterReduction < 0.97f ? 1.0f : std::max(0.0f, limiterLight - dt * 3.0f);
+        engine.limiterReduction = 1.0f;
+        if (!engine.transitionNote.empty()) {
+            toast(engine.transitionNote, IM_COL32(255, 210, 60, 255));
+            engine.transitionNote.clear();
+        }
+    }
+
+    // Automated UI smoke test: DUMMYDJ_TOUR=1 visits every screen, then quits.
+    static const bool tour = std::getenv("DUMMYDJ_TOUR") != nullptr;
+    if (tour) {
+        static int step = -1;
+        int s = int(time / 1.5f);
+        if (s != step) {
+            step = s;
+            std::printf("[tour] step %d  A:%s%s B:%s%s xf=%.2f run=%d\n", s, engine.decks[0].loaded() ? "loaded" : "-",
+                        engine.decks[0].playing ? "/playing" : "", engine.decks[1].loaded() ? "loaded" : "-",
+                        engine.decks[1].playing ? "/playing" : "", engine.crossfader, int(engine.run.state));
+            std::fflush(stdout);
+            showHelp = s < 2;
+            if (s == 2) engine.play(0);
+            if (s >= 3 && s <= 6) requestTab = s - 3;
+            if (s == 4) clip.selA = 44100 * 2, clip.selB = 44100 * 6;
+            if (s == 5) { trEdit.selected = 1; }
+            if (s == 7) { selectedTransition = 2; triggerTransition(); }
+            if (s >= 7 && s < 13) vis.mode = (s - 7) % Visualizer::NumModes;
+            if (s == 13) partyMode = true;
+            if (s == 15) { partyMode = false; confirmDeck = liveDeck(); confirmEntry = 3; }
+            if (s == 16) { confirmDeck = -1; autoDj = true; }
+            if (s == 18) sapp_request_quit();
+        }
+    }
+
+    ImVec2 ds = ImGui::GetIO().DisplaySize;
+    if (partyMode) {
+        drawParty();
+    } else {
+        float menuH;
+        drawMenuBar(menuH);
+        float y = menuH;
+        const float wfH = std::clamp(ds.y * 0.17f, 110.0f, 190.0f);
+        const float deckH = std::clamp(ds.y * 0.37f, 330.0f, 400.0f);
+        const float trH = 62.0f;
+        const float mixW = std::clamp(ds.x * 0.22f, 300.0f, 360.0f);
+        const float deckW = (ds.x - mixW) * 0.5f;
+        {
+            drawWaveforms(ImVec2(0, y), ImVec2(ds.x, wfH));
+            y += wfH;
+            drawDeck(0, ImVec2(0, y), ImVec2(deckW, deckH));
+            drawMixer(ImVec2(deckW, y), ImVec2(mixW, deckH));
+            drawDeck(1, ImVec2(deckW + mixW, y), ImVec2(ds.x - deckW - mixW, deckH));
+            y += deckH;
+            drawTransitionBar(ImVec2(0, y), ImVec2(ds.x, trH));
+            y += trH;
+        }
+        const float bottomH = std::max(200.0f, ds.y - y);
+        const float tabsW = std::floor(ds.x * 0.6f);
+        drawBottomTabs(ImVec2(0, y), ImVec2(tabsW, bottomH));
+        drawVisualizerPanel(ImVec2(tabsW, y), ImVec2(ds.x - tabsW, bottomH));
+    }
+    if (showHelp) drawHelpWindow();
+    if (showDemo) ImGui::ShowDemoWindow(&showDemo);
+    drawConfirmModal();
+    drawToasts();
+    lock.unlock();
+
+    vis.uploadTextures();
+    sg_pass pass{};
+    pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
+    pass.action.colors[0].clear_value = {0.05f, 0.05f, 0.07f, 1.0f};
+    pass.swapchain = sglue_swapchain();
+    sg_begin_pass(&pass);
+    simgui_render();
+    sg_end_pass();
+    sg_commit();
+}
+
+// ------------------------------------------------------ sokol callbacks ----
+
+static void audioCallback(float* buffer, int frames, int channels) {
+    if (g_app) g_app->engine.render(buffer, frames, channels);
+    else std::fill(buffer, buffer + size_t(frames) * size_t(channels), 0.0f);
+}
+
+static ImFont* tryLoadFont(const char* const* paths, int count, float size) {
+    ImGuiIO& io = ImGui::GetIO();
+    for (int i = 0; i < count; ++i) {
+        std::error_code ec;
+        if (fs::exists(paths[i], ec)) {
+            ImFont* f = io.Fonts->AddFontFromFileTTF(paths[i], size);
+            if (f) return f;
+        }
+    }
+    return nullptr;
+}
+
+static void setupStyle() {
+    ImGuiStyle& s = ImGui::GetStyle();
+    ImGui::StyleColorsDark(&s);
+    s.WindowRounding = 0.0f;
+    s.FrameRounding = 5.0f;
+    s.GrabRounding = 5.0f;
+    s.TabRounding = 5.0f;
+    s.ChildRounding = 6.0f;
+    s.PopupRounding = 6.0f;
+    s.WindowPadding = ImVec2(10, 8);
+    s.FramePadding = ImVec2(8, 5);
+    s.ItemSpacing = ImVec2(7, 6);
+    s.WindowBorderSize = 1.0f;
+    ImVec4* c = s.Colors;
+    c[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.07f, 0.10f, 1.0f);
+    c[ImGuiCol_ChildBg] = ImVec4(0.05f, 0.05f, 0.08f, 1.0f);
+    c[ImGuiCol_Border] = ImVec4(0.18f, 0.18f, 0.25f, 1.0f);
+    c[ImGuiCol_FrameBg] = ImVec4(0.13f, 0.13f, 0.19f, 1.0f);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(0.2f, 0.2f, 0.3f, 1.0f);
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.25f, 0.25f, 0.38f, 1.0f);
+    c[ImGuiCol_Button] = ImVec4(0.17f, 0.17f, 0.25f, 1.0f);
+    c[ImGuiCol_ButtonHovered] = ImVec4(0.26f, 0.26f, 0.4f, 1.0f);
+    c[ImGuiCol_ButtonActive] = ImVec4(0.35f, 0.3f, 0.55f, 1.0f);
+    c[ImGuiCol_Header] = ImVec4(0.2f, 0.18f, 0.32f, 1.0f);
+    c[ImGuiCol_HeaderHovered] = ImVec4(0.28f, 0.24f, 0.45f, 1.0f);
+    c[ImGuiCol_HeaderActive] = ImVec4(0.35f, 0.3f, 0.55f, 1.0f);
+    c[ImGuiCol_Tab] = ImVec4(0.12f, 0.12f, 0.18f, 1.0f);
+    c[ImGuiCol_TabHovered] = ImVec4(0.3f, 0.26f, 0.5f, 1.0f);
+    c[ImGuiCol_TabSelected] = ImVec4(0.25f, 0.22f, 0.42f, 1.0f);
+    c[ImGuiCol_SliderGrab] = ImVec4(0.55f, 0.5f, 0.9f, 1.0f);
+    c[ImGuiCol_CheckMark] = ImVec4(0.4f, 0.9f, 0.6f, 1.0f);
+    c[ImGuiCol_PlotHistogram] = ImVec4(0.4f, 0.8f, 1.0f, 1.0f);
+    c[ImGuiCol_MenuBarBg] = ImVec4(0.04f, 0.04f, 0.06f, 1.0f);
+}
+
+static void init() {
+    sg_desc desc{};
+    desc.environment = sglue_environment();
+    desc.logger.func = slog_func;
+    sg_setup(&desc);
+
+    simgui_desc_t sd{};
+    sd.max_vertices = 1 << 20;
+    sd.no_default_font = true;
+    sd.ini_filename = nullptr;
+    sd.logger.func = slog_func;
+    simgui_setup(&sd);
+    setupStyle();
+
+    g_app = new App();
+    static const char* uiFonts[] = {"/System/Library/Fonts/Supplemental/Arial.ttf",
+                                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                                    "C:\\Windows\\Fonts\\segoeui.ttf"};
+    static const char* bigFonts[] = {"/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
+                                     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                                     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                                     "C:\\Windows\\Fonts\\segoeuib.ttf"};
+    g_app->fontUi = tryLoadFont(uiFonts, 3, 15.0f);
+    if (!g_app->fontUi) g_app->fontUi = ImGui::GetIO().Fonts->AddFontDefault();
+    g_app->fontBig = tryLoadFont(bigFonts, 4, 22.0f);
+    if (!g_app->fontBig) g_app->fontBig = g_app->fontUi;
+
+    g_app->init();
+
+    saudio_desc ad{};
+    ad.sample_rate = kSampleRate;
+    ad.num_channels = 2;
+    ad.buffer_frames = 1024;
+    ad.stream_cb = audioCallback;
+    ad.logger.func = slog_func;
+    saudio_setup(&ad);
+    if (!saudio_isvalid()) g_app->toast("Audio device could not be opened!", ui::theme.warn);
+    else if (saudio_sample_rate() != kSampleRate)
+        g_app->toast("Warning: audio device runs at " + std::to_string(saudio_sample_rate()) + " Hz", ui::theme.warn);
+}
+
+static void frame() { g_app->frame(); }
+
+static void cleanup() {
+    saudio_shutdown();
+    g_app->shutdown();
+    App* app = g_app;
+    g_app = nullptr;  // audio is already stopped; this just makes it explicit
+    delete app;
+    simgui_shutdown();
+    sg_shutdown();
+}
+
+static void event(const sapp_event* ev) {
+    if (ev->type == SAPP_EVENTTYPE_FILES_DROPPED) {
+        std::vector<std::string> paths;
+        for (int i = 0; i < sapp_get_num_dropped_files(); ++i) paths.emplace_back(sapp_get_dropped_file_path(i));
+        g_app->onFilesDropped(paths);
+        return;
+    }
+    simgui_handle_event(ev);
+}
+
+sapp_desc sokol_main(int, char**) {
+    sapp_desc d{};
+    d.init_cb = init;
+    d.frame_cb = frame;
+    d.cleanup_cb = cleanup;
+    d.event_cb = event;
+    d.width = 1600;
+    d.height = 1000;
+    d.high_dpi = true;
+    d.window_title = "Dummy DJ Set";
+    d.enable_dragndrop = true;
+    d.max_dropped_files = 32;
+    d.max_dropped_file_path_length = 4096;
+    d.logger.func = slog_func;
+    return d;
+}
