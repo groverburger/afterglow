@@ -33,6 +33,23 @@ float readFrame(const Track& t, double pos, int ch) {
 
 }  // namespace
 
+// Marks the outermost engine call made from outside the audio thread; only
+// those are recorded (nested calls replay themselves).
+struct Engine::CallGuard {
+    Engine* e;
+    bool outer;
+    explicit CallGuard(Engine* en) : e(en), outer(en->depth_++ == 0 && !en->inAudio_) {
+        if (outer && e->replayActive_) e->userTouched_ = true;
+    }
+    ~CallGuard() { --e->depth_; }
+    CallGuard(const CallGuard&) = delete;
+    CallGuard& operator=(const CallGuard&) = delete;
+};
+
+#define RECORD_CALL(...)                                 \
+    CallGuard guard_(this);                               \
+    if (guard_.outer && recordable()) recordAction(__VA_ARGS__)
+
 // ---------------------------------------------------------------- Deck ----
 
 double Deck::beatAt(double frames) const {
@@ -67,6 +84,7 @@ Engine::Engine() : scope_(size_t(kScopeFrames) * 2, 0.0f) {
 
 void Engine::render(float* out, int frames, int channels) {
     std::lock_guard<std::mutex> lock(mutex);
+    inAudio_ = true;
     float block[kSubBlock * 2];
     int done = 0;
     while (done < frames) {
@@ -85,10 +103,16 @@ void Engine::render(float* out, int frames, int channels) {
         }
         done += n;
     }
+    inAudio_ = false;
 }
 
 void Engine::renderBlock(float* out, int frames) {
     std::memset(out, 0, sizeof(float) * size_t(frames) * 2);
+    if (replayActive_) {
+        runReplay();
+        // Waiting for a track: hold everything still so the set stays in time.
+        if (replayStalled) return;
+    }
     updateTransition(frames);
     followSync();
     for (int d = 0; d < 2; ++d) renderDeck(decks[d], out, frames, xfGain(d));
@@ -126,6 +150,13 @@ void Engine::renderBlock(float* out, int frames) {
     masterMeter[1] = std::max(masterMeter[1], peakR);
     limiterReduction = std::min(limiterReduction, minGain);
     clock += uint64_t(frames);
+    if (replayActive_ && !replayStalled) {
+        replayClock += uint64_t(frames);
+        if (replayNext >= replay.events.size() && replayClock >= replay.lengthFrames) {
+            replayActive_ = false;
+            replayFinished = true;
+        }
+    }
 }
 
 void Engine::renderDeck(Deck& dk, float* mix, int frames, float xfg) {
@@ -231,6 +262,14 @@ bool Engine::deckAudible(int d) const {
 // ----------------------------------------------------------- transport ----
 
 void Engine::loadTrack(int d, TrackPtr t) {
+    CallGuard guard_(this);
+    if (guard_.outer && recordable()) {
+        SetEvent ev;
+        ev.action = SetAction::Load;
+        ev.deck = d;
+        if (t) ev.track = trackRefFor(*t);
+        recordEvent(std::move(ev));
+    }
     Deck& dk = decks[d];
     if (run.state != TransitionRun::State::Idle && (run.in == d || run.out == d)) run.state = TransitionRun::State::Idle;
     dk.track = std::move(t);
@@ -251,10 +290,12 @@ void Engine::loadTrack(int d, TrackPtr t) {
 }
 
 void Engine::ejectTrack(int d) {
+    RECORD_CALL(SetAction::Load, d);
     loadTrack(d, nullptr);
 }
 
 void Engine::play(int d) {
+    RECORD_CALL(SetAction::Play, d);
     Deck& dk = decks[d];
     if (!dk.loaded()) return;
     if (dk.pos >= double(dk.track->frames()) - 2) dk.pos = dk.cuePoint;  // at the end: restart
@@ -273,11 +314,13 @@ void Engine::play(int d) {
 }
 
 void Engine::pause(int d) {
+    RECORD_CALL(SetAction::Pause, d);
     decks[d].playing = false;
     decks[d].motion = Motion::Normal;
 }
 
 void Engine::cueButton(int d) {
+    RECORD_CALL(SetAction::CueButton, d);
     Deck& dk = decks[d];
     if (!dk.loaded()) return;
     if (dk.playing) {
@@ -293,6 +336,7 @@ void Engine::cueButton(int d) {
 }
 
 void Engine::seek(int d, double frames) {
+    RECORD_CALL(SetAction::Seek, d, 0, frames);
     Deck& dk = decks[d];
     if (!dk.loaded()) return;
     const double last = double(dk.track->frames()) - 1;
@@ -310,6 +354,7 @@ void Engine::seek(int d, double frames) {
 }
 
 void Engine::setHotCue(int d, int slot) {
+    RECORD_CALL(SetAction::HotCueSet, d, slot);
     Deck& dk = decks[d];
     if (!dk.loaded()) return;
     double p = dk.pos;
@@ -319,6 +364,7 @@ void Engine::setHotCue(int d, int slot) {
 }
 
 void Engine::jumpHotCue(int d, int slot) {
+    RECORD_CALL(SetAction::HotCueJump, d, slot);
     Deck& dk = decks[d];
     if (!dk.loaded()) return;
     if (!dk.hotCueSet[slot]) {
@@ -335,6 +381,7 @@ void Engine::jumpHotCue(int d, int slot) {
 }
 
 void Engine::setLoop(int d, float beats) {
+    RECORD_CALL(SetAction::Loop, d, 0, beats);
     Deck& dk = decks[d];
     if (!dk.loaded()) return;
     if (dk.loopActive && dk.loopBeats == beats) {
@@ -352,9 +399,13 @@ void Engine::setLoop(int d, float beats) {
     if (dk.pos >= dk.loopOut) dk.pos = dk.loopIn + std::fmod(dk.pos - dk.loopIn, dk.loopOut - dk.loopIn);
 }
 
-void Engine::exitLoop(int d) { decks[d].loopActive = false; }
+void Engine::exitLoop(int d) {
+    RECORD_CALL(SetAction::LoopExit, d);
+    decks[d].loopActive = false;
+}
 
 void Engine::setLoopRange(int d, double inFrame, double outFrame) {
+    RECORD_CALL(SetAction::LoopRange, d, 0, inFrame, outFrame);
     Deck& dk = decks[d];
     if (!dk.loaded() || outFrame <= inFrame) return;
     dk.loopIn = inFrame;
@@ -366,6 +417,7 @@ void Engine::setLoopRange(int d, double inFrame, double outFrame) {
 }
 
 void Engine::startMotion(int d, Motion m) {
+    RECORD_CALL(SetAction::Motion, d, int(m));
     Deck& dk = decks[d];
     if (!dk.playing || dk.motion != Motion::Normal) return;
     dk.motion = m;
@@ -394,6 +446,7 @@ bool Engine::computeSync(int d, double* ratio, double* fold) const {
 }
 
 bool Engine::syncTempo(int d, std::string* why) {
+    RECORD_CALL(SetAction::SyncTempo, d);
     Deck& dk = decks[d];
     double ratio, fold;
     if (!computeSync(d, &ratio, &fold)) {
@@ -419,6 +472,7 @@ bool Engine::syncTempo(int d, std::string* why) {
 }
 
 void Engine::alignPhase(int d, double masterBeat, double fold, bool barAlign) {
+    RECORD_CALL(SetAction::AlignPhase, d, 0, masterBeat, fold, barAlign);
     Deck& dk = decks[d];
     if (!dk.loaded()) return;
     double b = dk.beatPos();
@@ -451,6 +505,7 @@ void Engine::followSync() {
 }
 
 void Engine::resetAllFx() {
+    RECORD_CALL(SetAction::ResetFx, 0);
     for (auto& dk : decks) {
         dk.eq[0] = dk.eq[1] = dk.eq[2] = 0.5f;
         dk.filter = 0.5f;
@@ -464,6 +519,7 @@ void Engine::resetAllFx() {
 // ---------------------------------------------------------- transitions ----
 
 bool Engine::startTransition(const TransitionDef& def, int outDeck, std::string* why, bool land) {
+    CallGuard guard_(this);
     if (transitionBusy()) {
         if (why) *why = "A transition is already running";
         return false;
@@ -480,6 +536,15 @@ bool Engine::startTransition(const TransitionDef& def, int outDeck, std::string*
     run.land = land;
     run.state = TransitionRun::State::Armed;
     transitionNote.clear();
+    if (guard_.outer && recordable()) {
+        SetEvent ev;
+        ev.action = SetAction::Transition;
+        ev.deck = outDeck;
+        ev.flag = land;
+        ev.text = def.name;
+        ev.def = def;
+        recordEvent(std::move(ev));
+    }
     return true;
 }
 
@@ -499,7 +564,10 @@ double Engine::landingPreRoll(const TransitionDef& def, int inDeck) const {
     return (1.0 - inStart) * length * inRate;
 }
 
-void Engine::cancelTransition() { run.state = TransitionRun::State::Idle; }
+void Engine::cancelTransition() {
+    RECORD_CALL(SetAction::CancelTransition, 0);
+    run.state = TransitionRun::State::Idle;
+}
 
 void Engine::updateTransition(int frames) {
     if (run.state == TransitionRun::State::Armed) {
@@ -659,5 +727,250 @@ void Engine::copyScope(float* dst, int frames) {
         size_t k = (start + size_t(i)) % kScopeFrames;
         dst[i * 2] = scope_[k * 2];
         dst[i * 2 + 1] = scope_[k * 2 + 1];
+    }
+}
+
+// ------------------------------------------------------------ recording ----
+
+void Engine::setPosition(int d, double frames) {
+    RECORD_CALL(SetAction::SetPos, d, 0, frames);
+    decks[d].pos = frames;
+}
+
+void Engine::recordEvent(SetEvent ev) {
+    ev.frame = recFrame();
+    rec_.push_back(std::move(ev));
+}
+
+void Engine::recordAction(SetAction a, int deck, int param, double v, double v2, bool flag) {
+    SetEvent ev;
+    ev.action = a;
+    ev.deck = deck;
+    ev.param = param;
+    ev.value = v;
+    ev.value2 = v2;
+    ev.flag = flag;
+    recordEvent(std::move(ev));
+}
+
+void Engine::recordNote(const std::string& text) {
+    if (!recording_) return;
+    SetEvent ev;
+    ev.action = SetAction::Note;
+    ev.text = text;
+    recordEvent(std::move(ev));
+}
+
+static bool isGlobalParam(SetParam p) { return int(p) >= int(SetParam::Crossfader); }
+
+double Engine::getParam(int deck, SetParam p) const {
+    const Deck& dk = decks[deck];
+    switch (p) {
+        case SetParam::Volume: return dk.volume;
+        case SetParam::Trim: return dk.trim;
+        case SetParam::EqLow: return dk.eq[0];
+        case SetParam::EqMid: return dk.eq[1];
+        case SetParam::EqHigh: return dk.eq[2];
+        case SetParam::Filter: return dk.filter;
+        case SetParam::Echo: return dk.echo;
+        case SetParam::Tempo: return dk.tempo;
+        case SetParam::TempoRange: return dk.tempoRange;
+        case SetParam::Sync: return dk.sync ? 1.0 : 0.0;
+        case SetParam::Nudge: return dk.nudge;
+        case SetParam::CuePoint: return dk.cuePoint;
+        case SetParam::Crossfader: return crossfader;
+        case SetParam::XfCurve: return xfCurve;
+        case SetParam::MasterVolume: return masterVolume;
+        case SetParam::Quantize: return quantize ? 1.0 : 0.0;
+        case SetParam::Count: break;
+    }
+    return 0.0;
+}
+
+void Engine::setParam(int deck, SetParam p, double v) {
+    Deck& dk = decks[deck];
+    switch (p) {
+        case SetParam::Volume: dk.volume = float(v); break;
+        case SetParam::Trim: dk.trim = float(v); break;
+        case SetParam::EqLow: dk.eq[0] = float(v); break;
+        case SetParam::EqMid: dk.eq[1] = float(v); break;
+        case SetParam::EqHigh: dk.eq[2] = float(v); break;
+        case SetParam::Filter: dk.filter = float(v); break;
+        case SetParam::Echo: dk.echo = float(v); break;
+        case SetParam::Tempo: dk.tempo = v; break;
+        case SetParam::TempoRange: dk.tempoRange = float(v); break;
+        case SetParam::Sync: dk.sync = v != 0.0; break;
+        case SetParam::Nudge: dk.nudge = v; break;
+        case SetParam::CuePoint: dk.cuePoint = v; break;
+        case SetParam::Crossfader: crossfader = float(v); break;
+        case SetParam::XfCurve: xfCurve = int(v); break;
+        case SetParam::MasterVolume: masterVolume = float(v); break;
+        case SetParam::Quantize: quantize = v != 0.0; break;
+        case SetParam::Count: break;
+    }
+}
+
+void Engine::beginUserEdits() {
+    for (int d = 0; d < 2; ++d) {
+        for (int p = 0; p < int(SetParam::Count); ++p)
+            params_[d * int(SetParam::Count) + p].snap = getParam(d, SetParam(p));
+        snapPos_[d] = decks[d].pos;
+        snapPlaying_[d] = decks[d].playing;
+        for (int i = 0; i < kNumHotCues; ++i) snapHotCue_[d][i] = decks[d].hotCueSet[i];
+    }
+    userTouched_ = false;
+}
+
+void Engine::endUserEdits() {
+    bool changed = false;
+    for (int d = 0; d < 2; ++d) {
+        Deck& dk = decks[d];
+        // Direct playhead moves on a paused deck (jog / scrub).
+        if (!snapPlaying_[d] && !dk.playing && dk.pos != snapPos_[d]) {
+            changed = true;
+            if (recordable()) recordAction(SetAction::SetPos, d, 0, dk.pos);
+        }
+        for (int i = 0; i < kNumHotCues; ++i) {
+            if (snapHotCue_[d][i] && !dk.hotCueSet[i]) {
+                changed = true;
+                if (recordable()) recordAction(SetAction::HotCueClear, d, i);
+            }
+        }
+        for (int p = 0; p < int(SetParam::Count); ++p) {
+            if (d == 1 && isGlobalParam(SetParam(p))) continue;
+            if (getParam(d, SetParam(p)) != params_[d * int(SetParam::Count) + p].snap) changed = true;
+        }
+    }
+    emitParams();
+    if (replayActive_ && (changed || userTouched_)) {
+        stopReplay();
+        tookOver = true;
+    }
+    userTouched_ = false;
+}
+
+void Engine::emitParams() {
+    // Records exactly the changes made since beginUserEdits(). Changes the engine
+    // makes by itself (transition lanes, sync) happen outside that window and
+    // replay on their own. Values are exact so replay matches sample for sample.
+    if (!recordable()) return;
+    for (int d = 0; d < 2; ++d) {
+        for (int p = 0; p < int(SetParam::Count); ++p) {
+            if (d == 1 && isGlobalParam(SetParam(p))) continue;
+            const double cur = getParam(d, SetParam(p));
+            if (cur != params_[d * int(SetParam::Count) + p].snap) recordAction(SetAction::Param, d, p, cur);
+        }
+    }
+}
+
+void Engine::startRecording() {
+    recording_ = true;
+    recStart_ = clock;
+    rec_.clear();
+    // Opening snapshot so the set replays from the exact starting state.
+    for (int d = 0; d < 2; ++d) {
+        const Deck& dk = decks[d];
+        SetEvent load;
+        load.action = SetAction::Load;
+        load.deck = d;
+        if (dk.track) load.track = trackRefFor(*dk.track);
+        recordEvent(std::move(load));
+        if (!dk.track) continue;
+        for (int i = 0; i < kNumHotCues; ++i)
+            if (dk.hotCueSet[i]) recordAction(SetAction::HotCueAt, d, i, dk.hotCues[i]);
+        if (dk.loopActive) recordAction(SetAction::LoopRange, d, 0, dk.loopIn, dk.loopOut);
+        for (int p = 0; p < int(SetParam::Count); ++p)
+            if (!isGlobalParam(SetParam(p))) recordAction(SetAction::Param, d, p, getParam(d, SetParam(p)));
+        recordAction(SetAction::SetPos, d, 0, dk.pos);
+        recordAction(SetAction::SetPlaying, d, 0, 0, 0, dk.playing);
+    }
+    for (int p = int(SetParam::Crossfader); p < int(SetParam::Count); ++p)
+        recordAction(SetAction::Param, 0, p, getParam(0, SetParam(p)));
+    recordAction(SetAction::MasterDeck, masterDeck);
+}
+
+SetRecording Engine::stopRecording(const std::string& name) {
+    SetRecording set;
+    set.name = name;
+    set.lengthFrames = recFrame();
+    set.events = std::move(rec_);
+    rec_.clear();
+    recording_ = false;
+    return set;
+}
+
+// --------------------------------------------------------------- replay ----
+
+void Engine::startReplay(SetRecording set) {
+    run.state = TransitionRun::State::Idle;
+    for (auto& dk : decks) {
+        dk.playing = false;
+        dk.motion = Motion::Normal;
+        dk.nudge = 0;
+    }
+    previewing = false;
+    replay = std::move(set);
+    replayNext = 0;
+    replayClock = 0;
+    replayStalled = false;
+    replayFinished = false;
+    tookOver = false;
+    replayNotes.clear();
+    replayActive_ = true;
+}
+
+void Engine::stopReplay() { replayActive_ = false; }
+
+void Engine::runReplay() {
+    replayStalled = false;
+    while (replayNext < replay.events.size()) {
+        SetEvent& ev = replay.events[replayNext];
+        if (ev.frame > replayClock) break;
+        if (ev.action == SetAction::Load && !ev.track.empty() && !ev.resolved && !ev.resolveFailed) {
+            replayStalled = true;  // wait for the UI / renderer to provide the audio
+            return;
+        }
+        applyEvent(ev);
+        ev.resolved.reset();  // the deck holds its own reference now
+        ++replayNext;
+    }
+}
+
+void Engine::applyEvent(const SetEvent& ev) {
+    const int d = std::clamp(ev.deck, 0, 1);
+    switch (ev.action) {
+        case SetAction::Note: replayNotes.push_back(ev.text); break;
+        case SetAction::Load: loadTrack(d, ev.resolved); break;
+        case SetAction::Play: play(d); break;
+        case SetAction::Pause: pause(d); break;
+        case SetAction::CueButton: cueButton(d); break;
+        case SetAction::Seek: seek(d, ev.value); break;
+        case SetAction::SetPos: decks[d].pos = ev.value; break;
+        case SetAction::SetPlaying:
+            decks[d].playing = ev.flag && decks[d].loaded();
+            decks[d].motion = Motion::Normal;
+            break;
+        case SetAction::HotCueSet: setHotCue(d, std::clamp(ev.param, 0, kNumHotCues - 1)); break;
+        case SetAction::HotCueJump: jumpHotCue(d, std::clamp(ev.param, 0, kNumHotCues - 1)); break;
+        case SetAction::HotCueClear: decks[d].hotCueSet[std::clamp(ev.param, 0, kNumHotCues - 1)] = false; break;
+        case SetAction::HotCueAt: {
+            int slot = std::clamp(ev.param, 0, kNumHotCues - 1);
+            decks[d].hotCues[slot] = ev.value;
+            decks[d].hotCueSet[slot] = true;
+            break;
+        }
+        case SetAction::Loop: setLoop(d, float(ev.value)); break;
+        case SetAction::LoopExit: exitLoop(d); break;
+        case SetAction::LoopRange: setLoopRange(d, ev.value, ev.value2); break;
+        case SetAction::Motion: startMotion(d, Motion(std::clamp(ev.param, 0, 2))); break;
+        case SetAction::SyncTempo: syncTempo(d, nullptr); break;
+        case SetAction::AlignPhase: alignPhase(d, ev.value, ev.value2, ev.flag); break;
+        case SetAction::Transition: startTransition(ev.def, d, nullptr, ev.flag); break;
+        case SetAction::CancelTransition: cancelTransition(); break;
+        case SetAction::ResetFx: resetAllFx(); break;
+        case SetAction::MasterDeck: masterDeck = d; break;
+        case SetAction::Param:
+            if (ev.param >= 0 && ev.param < int(SetParam::Count)) setParam(d, SetParam(ev.param), ev.value);
+            break;
     }
 }

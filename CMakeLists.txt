@@ -50,7 +50,7 @@ add_library(dr_libs STATIC src/platform/dr_impl.c)
 target_include_directories(dr_libs PUBLIC third_party/dr_libs)
 
 # ---- app core (no UI; also used by the tests) --------------------------------
-add_library(afterglow_core STATIC src/Engine.cpp src/Transitions.cpp src/SynthGen.cpp src/TrackIO.cpp src/Library.cpp)
+add_library(afterglow_core STATIC src/Engine.cpp src/SetFile.cpp src/Transitions.cpp src/SynthGen.cpp src/TrackIO.cpp src/Library.cpp)
 target_include_directories(afterglow_core PUBLIC src)
 target_link_libraries(afterglow_core PUBLIC dr_libs Threads::Threads)
 target_compile_options(afterglow_core PRIVATE ${AFTERGLOW_WARNINGS})
@@ -62,8 +62,17 @@ file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/font_roboto.h"
      "#pragma once\ninline const unsigned char afterglow_font_roboto[] = {${FONT_BYTES}};\n")
 
+# Embed the demo set; the app installs it into the user's sets folder on first run.
+# Regenerate with: afterglow_set compose "assets/sets/Sunset to Jungle.set"
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/assets/sets/Sunset to Jungle.set" DEMO_SET_HEX HEX)
+string(REGEX REPLACE "(..)" "0x\\1," DEMO_SET_BYTES "${DEMO_SET_HEX}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/demo_set.h"
+     "#pragma once\ninline const unsigned char afterglow_demo_set[] = {${DEMO_SET_BYTES}};\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/assets/sets/Sunset to Jungle.set" "${CMAKE_CURRENT_SOURCE_DIR}/assets/Roboto-Regular.ttf")
+
 # ---- the app -----------------------------------------------------------------
-set(APP_SOURCES src/main.cpp src/UIDecks.cpp src/UIPanels.cpp src/Visuals.cpp src/Widgets.cpp)
+set(APP_SOURCES src/main.cpp src/UIDecks.cpp src/UIPanels.cpp src/UISets.cpp src/Visuals.cpp src/Widgets.cpp)
 if(APPLE)
   set(APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/Afterglow.icns")
   set_source_files_properties(${APP_ICON} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
@@ -82,6 +91,13 @@ set_target_properties(afterglow PROPERTIES
   MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
   MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION})
 install(TARGETS afterglow BUNDLE DESTINATION . RUNTIME DESTINATION bin)
+
+# ---- tools -------------------------------------------------------------------
+# Set tool: `afterglow_set compose <out.set> [out.wav]` records the scripted demo set,
+# `afterglow_set render <in.set> <out.wav>` renders any recorded set.
+add_executable(afterglow_set tools/afterglow_set.cpp)
+target_link_libraries(afterglow_set PRIVATE afterglow_core)
+target_compile_options(afterglow_set PRIVATE ${AFTERGLOW_WARNINGS})
 
 # ---- tests -------------------------------------------------------------------
 if(BUILD_TESTING)

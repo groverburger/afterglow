@@ -1,6 +1,7 @@
 // Transition definitions: automation lanes that move mixer controls over time.
 #pragma once
 #include <array>
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,11 @@ struct TransitionDef {
 
 std::vector<TransitionDef> makeStockTransitions();
 
-// Plain-text persistence for custom transitions.
+// Plain-text persistence. parseTransitions() skips any lines outside
+// "transition ... end" blocks, so the format can be embedded in other files.
+void writeTransition(std::ostream& out, const TransitionDef& def);
+std::vector<TransitionDef> parseTransitions(std::istream& in);
+std::string quoteString(const std::string& s);
+bool readQuotedString(std::istream& in, std::string& out);
 bool saveTransitions(const std::string& path, const std::vector<TransitionDef>& defs);
 std::vector<TransitionDef> loadTransitions(const std::string& path);

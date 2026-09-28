@@ -174,6 +174,29 @@ int Library::addClip(TrackPtr clip) {
     return int(entries_.size()) - 1;
 }
 
+int Library::findByRef(const TrackRef& ref) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            const LibraryEntry& e = *entries_[i];
+            if (ref.kind == "stock" && e.kind == EntryKind::Stock && e.name == ref.name) return int(i);
+            if (ref.kind == "clip" && e.kind == EntryKind::Clip && e.name == ref.name) return int(i);
+            if (ref.kind == "file" && e.kind == EntryKind::Imported && e.path == ref.path) return int(i);
+        }
+    }
+    std::error_code ec;
+    if (ref.kind == "file" && fs::exists(ref.path, ec)) return addFile(ref.path);
+    return -1;
+}
+
+int Library::findByTrack(const Track* t) {
+    if (!t) return -1;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < entries_.size(); ++i)
+        if (entries_[i]->track.get() == t) return int(i);
+    return -1;
+}
+
 bool Library::persistClip(const Track& clip, std::string* error) {
     std::error_code ec;
     fs::create_directories(clipDir_, ec);

@@ -1683,6 +1683,13 @@ const std::vector<SongSpec>& stockSongs() {
     return songs;
 }
 
+std::vector<SongSection> songSections(const SongSpec& spec) {
+    static const char* names[] = {"Intro", "Build", "Drop", "Breakdown", "Build 2", "Drop 2", "Outro"};
+    std::vector<SongSection> out;
+    for (const Section& s : makeSections(makeStyle(spec.style))) out.push_back({names[int(s.kind)], s.start, s.bars});
+    return out;
+}
+
 TrackPtr renderSong(const SongSpec& spec, std::atomic<float>* progress) {
     auto setProgress = [&](float p) {
         if (progress) progress->store(p);

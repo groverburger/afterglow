@@ -110,8 +110,8 @@ void App::saveClip(TrackPtr c) {
 void App::drawBottomTabs(ImVec2 pos, ImVec2 size) {
     beginPanel("##bottom", pos, size);
     if (ImGui::BeginTabBar("##tabs")) {
-        const char* names[4] = {"Library", "Clip Editor", "Transition Editor", "Auto DJ"};
-        for (int i = 0; i < 4; ++i) {
+        const char* names[5] = {"Library", "Clip Editor", "Transition Editor", "Auto DJ", "Sets"};
+        for (int i = 0; i < 5; ++i) {
             ImGuiTabItemFlags f = requestTab == i ? ImGuiTabItemFlags_SetSelected : 0;
             if (ImGui::BeginTabItem(names[i], nullptr, f)) {
                 bottomTab = i;
@@ -120,6 +120,7 @@ void App::drawBottomTabs(ImVec2 pos, ImVec2 size) {
                     case 1: drawClipEditor(); break;
                     case 2: drawTransitionEditor(); break;
                     case 3: drawAutoDj(); break;
+                    case 4: drawSets(); break;
                 }
                 ImGui::EndTabItem();
             }

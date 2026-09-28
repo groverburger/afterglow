@@ -85,6 +85,9 @@ const char* effectId(OutEffect e) {
 
 }  // namespace
 
+std::string quoteString(const std::string& s) { return quoted(s); }
+bool readQuotedString(std::istream& in, std::string& out) { return readQuoted(in, out); }
+
 const char* paramName(Param p) { return kParamInfo[int(p)].name; }
 const char* paramId(Param p) { return kParamInfo[int(p)].id; }
 float paramNeutral(Param p) { return kParamInfo[int(p)].neutral; }
@@ -181,33 +184,41 @@ std::vector<TransitionDef> makeStockTransitions() {
     return v;
 }
 
+void writeTransition(std::ostream& out, const TransitionDef& d) {
+    const auto oldPrecision = out.precision(9);  // floats round-trip exactly
+    out << "transition " << quoted(d.name) << "\n";
+    out << "description " << quoted(d.description) << "\n";
+    out << "beats " << d.beats << "\n";
+    out << "in_start " << d.inStartAt << "\n";
+    out << "out_effect " << effectId(d.outEffect) << " " << d.outEffectAt << "\n";
+    for (int p = 0; p < kNumParams; ++p) {
+        const Lane& l = d.lanes[size_t(p)];
+        if (!l.enabled) continue;
+        out << "lane " << paramId(Param(p));
+        for (const auto& k : l.keys) out << " " << k.t << ":" << k.v << ":" << int(k.shape);
+        out << "\n";
+    }
+    out << "end\n\n";
+    out.precision(oldPrecision);
+}
+
 bool saveTransitions(const std::string& path, const std::vector<TransitionDef>& defs) {
     std::ofstream out(path);
     if (!out) return false;
     out << "# Afterglow custom transitions. Format: key/value lines, one block per transition.\n";
-    for (const auto& d : defs) {
-        if (d.stock) continue;
-        out << "transition " << quoted(d.name) << "\n";
-        out << "description " << quoted(d.description) << "\n";
-        out << "beats " << d.beats << "\n";
-        out << "in_start " << d.inStartAt << "\n";
-        out << "out_effect " << effectId(d.outEffect) << " " << d.outEffectAt << "\n";
-        for (int p = 0; p < kNumParams; ++p) {
-            const Lane& l = d.lanes[size_t(p)];
-            if (!l.enabled) continue;
-            out << "lane " << paramId(Param(p));
-            for (const auto& k : l.keys) out << " " << k.t << ":" << k.v << ":" << int(k.shape);
-            out << "\n";
-        }
-        out << "end\n\n";
-    }
+    for (const auto& d : defs)
+        if (!d.stock) writeTransition(out, d);
     return bool(out);
 }
 
 std::vector<TransitionDef> loadTransitions(const std::string& path) {
-    std::vector<TransitionDef> defs;
     std::ifstream in(path);
-    if (!in) return defs;
+    if (!in) return {};
+    return parseTransitions(in);
+}
+
+std::vector<TransitionDef> parseTransitions(std::istream& in) {
+    std::vector<TransitionDef> defs;
     TransitionDef cur;
     bool open = false;
     std::string line;

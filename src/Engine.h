@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "DSP.h"
+#include "SetFile.h"
 #include "Track.h"
 #include "Transitions.h"
 
@@ -152,8 +153,65 @@ public:
 
     uint64_t clock = 0;  // frames rendered
 
+    // Raw playhead jump (no quantize), e.g. for jogging a paused deck.
+    void setPosition(int d, double frames);
+
+    // ---- Set recording ----
+    // Every outermost action call made from outside the audio thread is recorded.
+    // Direct control changes (knobs, faders...) must be bracketed by
+    // beginUserEdits()/endUserEdits() so they can be recorded as well.
+    void beginUserEdits();
+    void endUserEdits();
+    void startRecording();  // snapshots the current state as the set's opening events
+    SetRecording stopRecording(const std::string& name);
+    bool isRecording() const { return recording_; }
+    double recordingSec() const { return recording_ ? double(clock - recStart_) / kSampleRate : 0.0; }
+    void recordNote(const std::string& text);
+
+    // ---- Set replay (runs on the audio thread, sample accurate) ----
+    // Load events must get `resolved` filled in before they fall due; replay
+    // waits (stalls) at an unresolved load.
+    void startReplay(SetRecording set);
+    void stopReplay();
+    bool replayActive() const { return replayActive_; }
+    SetRecording replay;
+    size_t replayNext = 0;
+    uint64_t replayClock = 0;
+    bool replayStalled = false;
+    bool replayFinished = false;
+    bool tookOver = false;                 // user touched a control during replay
+    std::vector<std::string> replayNotes;  // Note events for the UI to show
+
 private:
     static constexpr int kScopeFrames = 16384;
+
+    // Recorder state.
+    struct CallGuard;
+    static constexpr int kParamSlots = 2 * int(SetParam::Count);
+    struct ParamTrack {
+        double snap = 0;  // value at beginUserEdits
+    };
+    bool recording_ = false;
+    uint64_t recStart_ = 0;
+    std::vector<SetEvent> rec_;
+    ParamTrack params_[kParamSlots];
+    double snapPos_[2] = {0, 0};
+    bool snapPlaying_[2] = {false, false};
+    bool snapHotCue_[2][kNumHotCues] = {};
+    bool inAudio_ = false;
+    int depth_ = 0;
+    bool userTouched_ = false;
+    bool replayActive_ = false;
+
+    bool recordable() const { return recording_ && !inAudio_; }
+    uint64_t recFrame() const { return clock - recStart_; }
+    void recordEvent(SetEvent ev);
+    void recordAction(SetAction a, int deck, int param = 0, double v = 0, double v2 = 0, bool flag = false);
+    double getParam(int deck, SetParam p) const;
+    void setParam(int deck, SetParam p, double v);
+    void emitParams();
+    void runReplay();
+    void applyEvent(const SetEvent& ev);
     std::vector<float> scope_;
     size_t scopeWrite_ = 0;
 

@@ -37,6 +37,14 @@ struct SongSpec {
     SongStyle style;
 };
 
+// Arrangement of a generated song, in bars from the start.
+struct SongSection {
+    const char* name;  // "Intro", "Build", "Drop", "Breakdown", "Build 2", "Drop 2", "Outro"
+    int startBar;
+    int bars;
+};
+std::vector<SongSection> songSections(const SongSpec& spec);
+
 // The stock library, in display order.
 const std::vector<SongSpec>& stockSongs();
 

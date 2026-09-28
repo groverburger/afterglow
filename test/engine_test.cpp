@@ -3,9 +3,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 
 #include "Engine.h"
+#include "SetFile.h"
 #include "SynthGen.h"
 #include "Transitions.h"
 
@@ -138,6 +140,76 @@ int main() {
         double oFrac = e.decks[0].beatPos() - std::round(e.decks[0].beatPos());
         // (Skipped when the out deck was braked or spun, which moves it off its grid on purpose.)
         if (def.outEffect == OutEffect::None) CHECK(std::fabs(oFrac) < 0.05, "%s off-grid", def.name.c_str());
+    }
+
+    // Record a hands-on session, save + parse it, replay it: audio must be identical.
+    {
+        auto session = [&](Engine& e, bool live, uint64_t* hash) {
+            std::vector<float> buf(64 * 2);
+            uint64_t h = 1469598103934665603ULL;
+            for (int blk = 0; blk < 44100 * 40 / 64; ++blk) {
+                if (live) {
+                    const double t = blk * 64.0 / kSampleRate;
+                    // Scripted "user": the kind of calls the GUI makes.
+                    auto at = [&](double s) { return blk == int(s * kSampleRate / 64); };
+                    e.beginUserEdits();
+                    if (at(0.0)) { e.loadTrack(0, tracks[1]); e.loadTrack(1, tracks[6]); e.crossfader = 0.0f; e.play(0); }
+                    if (at(2.0)) e.decks[0].eq[2] = 0.2f;                      // knob turn
+                    if (t > 3.0 && t < 5.0) e.decks[0].filter = float(0.5 + (t - 3.0) * 0.1);  // filter sweep
+                    if (at(5.0)) e.decks[0].filter = 0.5f;
+                    if (at(6.0)) e.setLoop(0, 2.0f);
+                    if (at(8.0)) e.exitLoop(0);
+                    if (at(9.0)) e.decks[1].pos += 12345.0;                   // jog the paused deck
+                    if (at(9.5)) e.setHotCue(0, 1);
+                    if (at(11.0)) {
+                        std::string why;
+                        e.startTransition(defs[1], 0, &why, true);             // Bass Swap, landing
+                    }
+                    if (at(30.0)) e.jumpHotCue(1, 0);
+                    if (at(31.0)) e.decks[1].echo = 0.7f;
+                    if (at(32.0)) e.decks[1].echo = 0.0f;
+                    e.endUserEdits();
+                }
+                e.render(buf.data(), 64, 2);
+                for (float x : buf) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &x, 4);
+                    h = (h ^ bits) * 1099511628211ULL;
+                }
+            }
+            *hash = h;
+        };
+        Engine live;
+        live.startRecording();
+        uint64_t liveHash, replayHash;
+        session(live, true, &liveHash);
+        SetRecording rec = live.stopRecording("test");
+        const std::string setPath = (std::filesystem::temp_directory_path() / "afterglow_test.set").string();
+        CHECK(saveSet(setPath, rec), "save set");
+        SetRecording loaded;
+        std::string err;
+        CHECK(loadSet(setPath, loaded, &err), "load set: %s", err.c_str());
+        for (auto& ev : loaded.events)
+            if (ev.action == SetAction::Load && !ev.track.empty())
+                for (auto& t : tracks)
+                    if (t->name == ev.track.name) ev.resolved = t;
+        Engine replay;
+        replay.startReplay(loaded);
+        session(replay, false, &replayHash);
+        std::printf("record/replay: %zu events, replay %s\n", rec.events.size(),
+                    liveHash == replayHash ? "bit-identical" : "DIFFERS");
+        CHECK(liveHash == replayHash, "replayed session differs from the live one");
+        CHECK(!replay.replayActive() && replay.replayFinished, "replay should have finished");
+
+        // Touching a control during replay hands the mix back to the user.
+        Engine t;
+        t.startReplay(loaded);
+        std::vector<float> buf(64 * 2);
+        for (int i = 0; i < 100; ++i) t.render(buf.data(), 64, 2);
+        t.beginUserEdits();
+        t.crossfader = 0.3f;
+        t.endUserEdits();
+        CHECK(!t.replayActive() && t.tookOver, "take-over");
     }
 
     // Manual play with sync + quantize lands in phase (bar-aligned).

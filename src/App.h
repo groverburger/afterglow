@@ -1,6 +1,9 @@
 // Application state shared by the UI modules.
 #pragma once
+#include <atomic>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "Engine.h"
@@ -39,6 +42,12 @@ struct TransitionEditorState {
 
 enum class AutoDjOrder { Library, Shuffle, ByTempo };
 
+struct SetInfo {
+    std::string name;
+    std::string path;
+    double lengthSec = 0;
+};
+
 struct App {
     Engine engine;
     Library library;
@@ -69,8 +78,23 @@ struct App {
     float time = 0;
     std::string userDir;  // per-user data folder, set in init()
     std::string musicDir() const { return userDir + "/music"; }
+    std::string setsDir() const { return userDir + "/sets"; }
     ImFont* fontUi = nullptr;
     ImFont* fontBig = nullptr;
+
+    // Sets: recording, live replay and audio export.
+    std::vector<SetInfo> sets;
+    bool setsDirty = true;
+    char recName[96] = "";
+    std::string replayName;
+    std::string pendingReplayPath;  // started after the UI frame, so it isn't mistaken for a take-over
+    const Track* lastDeckTrack[2] = {nullptr, nullptr};
+    std::thread exportThread;
+    std::atomic<bool> exportRunning{false};
+    std::atomic<float> exportProgress{0.0f};
+    std::mutex exportMutex;
+    std::string exportMessage;  // set by the export thread when it finishes
+    std::string exportName;
 
     // Lifecycle.
     void init();
@@ -111,6 +135,14 @@ struct App {
     void handleShortcuts();
     void processPendingLoads();
     void updateAutoDj();
+    void drawSets();
+    void refreshSets();
+    void installDemoSet();
+    void playSet(const std::string& path);   // queues; starts after the current UI frame
+    void startPendingReplay();
+    void updateSets();                       // per frame: notes, take-over, load lookahead
+    void stopAndSaveRecording();
+    void exportSet(const SetInfo& info);
 };
 
 // Camelot-wheel key compatibility; returns false when either key is unknown.

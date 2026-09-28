@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "SetFile.h"
 #include "Track.h"
 
 enum class EntryKind { Stock, Imported, Clip };
@@ -44,6 +45,10 @@ public:
     void request(int i, bool urgent);
     int addFile(const std::string& path);
     int addClip(TrackPtr clip);
+    // Entry for a recorded set's track reference (imports missing files that exist). -1 if unknown.
+    int findByRef(const TrackRef& ref);
+    // Entry whose loaded audio is `t`, or -1.
+    int findByTrack(const Track* t);
     // Saves a clip as WAV + metadata next to the other clips. Returns false on error.
     bool persistClip(const Track& clip, std::string* error);
     bool busy();

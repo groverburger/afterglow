@@ -20,6 +20,7 @@
 namespace fs = std::filesystem;
 
 static App* g_app = nullptr;
+static std::string g_playSetArg;  // --play-set <name or path>
 
 // Per-user folder for clips, transitions, settings and the music drop folder.
 static std::string userDataDir() {
@@ -205,6 +206,16 @@ void App::saveCustomTransitions() {
 void App::init() {
     userDir = userDataDir();
     library.init(musicDir(), userDir + "/clips");
+    installDemoSet();
+    if (!g_playSetArg.empty()) {
+        // Accept a path or the name of a set in the sets folder.
+        std::string path = g_playSetArg;
+        std::error_code ec;
+        if (!fs::exists(path, ec)) path = setsDir() + "/" + g_playSetArg + (fs::path(g_playSetArg).has_extension() ? "" : ".set");
+        playSet(path);
+        showHelp = false;
+        requestTab = 4;
+    }
 
     transitions = makeStockTransitions();
     for (auto& t : loadTransitions(userDir + "/transitions.txt")) transitions.push_back(t);
@@ -217,7 +228,10 @@ void App::init() {
     engine.crossfader = 0.0f;
 }
 
-void App::shutdown() { vis.shutdown(); }
+void App::shutdown() {
+    if (exportThread.joinable()) exportThread.join();
+    vis.shutdown();
+}
 
 void App::onFilesDropped(const std::vector<std::string>& paths) {
     int added = 0;
@@ -435,8 +449,30 @@ void App::drawMenuBar(float& height) {
         ImGui::EndMenu();
     }
     // Status on the right.
-    char buf[160];
+    char buf[200];
     int live = liveDeck();
+    float right = 20;
+    if (engine.isRecording() || engine.replayActive()) {
+        // Recording / set playback indicator with its own stop button.
+        const bool rec = engine.isRecording();
+        char st[120];
+        if (rec) std::snprintf(st, sizeof(st), "REC %s", formatTime(engine.recordingSec()).c_str());
+        else std::snprintf(st, sizeof(st), "SET: %s  %s", replayName.c_str(),
+                           formatTime(double(engine.replayClock) / kSampleRate).c_str());
+        float sw = ImGui::CalcTextSize(st).x + ImGui::CalcTextSize(rec ? "Stop & save" : "Stop").x + 40;
+        ImGui::SameLine(ImGui::GetWindowWidth() - sw - 20);
+        float blink = std::fmod(time, 1.0f) < 0.5f ? 1.0f : 0.4f;
+        ImGui::TextColored(rec ? ImVec4(1, 0.25f, 0.25f, blink) : ImVec4(0.5f, 0.85f, 1, 1), "%s", st);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(rec ? "Stop & save" : "Stop")) {
+            if (rec) stopAndSaveRecording();
+            else {
+                engine.stopReplay();
+                for (int d = 0; d < 2; ++d) engine.pause(d);
+            }
+        }
+        right += sw + 20;
+    }
     if (live >= 0) {
         const Deck& d = engine.decks[live];
         std::snprintf(buf, sizeof(buf), "ON AIR: %s  |  %.1f BPM", d.track ? d.track->name.c_str() : "-", d.effectiveBpm());
@@ -444,7 +480,7 @@ void App::drawMenuBar(float& height) {
         std::snprintf(buf, sizeof(buf), "Silence - press PLAY on a deck (or Q / P)");
     }
     float w = ImGui::CalcTextSize(buf).x;
-    ImGui::SameLine(ImGui::GetWindowWidth() - w - 20);
+    ImGui::SameLine(ImGui::GetWindowWidth() - w - right);
     ImGui::TextColored(live >= 0 ? ImVec4(1, 0.4f, 0.4f, 1) : ImVec4(0.6f, 0.6f, 0.7f, 1), "%s", buf);
     height = ImGui::GetWindowSize().y;
     ImGui::EndMainMenuBar();
@@ -511,6 +547,9 @@ void App::frame() {
 
     // The UI owns the engine for the duration of the UI build (a few ms).
     std::unique_lock<std::mutex> lock(engine.mutex);
+    // Everything the UI does to the engine this frame counts as a user edit:
+    // it gets recorded, and during set playback it means "I'm taking over".
+    engine.beginUserEdits();
     processPendingLoads();
     vis.update(engine, dt);
     handleShortcuts();
@@ -538,9 +577,12 @@ void App::frame() {
         int s = int(time / 1.5f);
         if (s != step) {
             step = s;
-            std::printf("[tour] step %d  A:%s%s B:%s%s xf=%.2f run=%d\n", s, engine.decks[0].loaded() ? "loaded" : "-",
-                        engine.decks[0].playing ? "/playing" : "", engine.decks[1].loaded() ? "loaded" : "-",
-                        engine.decks[1].playing ? "/playing" : "", engine.crossfader, int(engine.run.state));
+            std::printf("[tour] step %d  A:%s%s B:%s%s xf=%.2f run=%d rec=%d replay=%d@%.1fs events=%zu/%zu\n", s,
+                        engine.decks[0].loaded() ? engine.decks[0].track->name.c_str() : "-",
+                        engine.decks[0].playing ? "/playing" : "", engine.decks[1].loaded() ? engine.decks[1].track->name.c_str() : "-",
+                        engine.decks[1].playing ? "/playing" : "", engine.crossfader, int(engine.run.state),
+                        engine.isRecording(), engine.replayActive(), double(engine.replayClock) / kSampleRate,
+                        engine.replayNext, engine.replay.events.size());
             std::fflush(stdout);
             showHelp = s < 2;
             if (s == 2) engine.play(0);
@@ -553,7 +595,16 @@ void App::frame() {
             if (s == 13) partyMode = true;
             if (s == 15) { partyMode = false; confirmDeck = liveDeck(); confirmEntry = 3; }
             if (s == 16) { confirmDeck = -1; autoDj = true; }
-            if (s == 18) sapp_request_quit();
+            if (s == 17) { autoDj = false; requestTab = 4; engine.startRecording(); }
+            if (s == 18) engine.crossfader = 0.6f;  // a recorded move
+            if (s == 19) { std::snprintf(recName, sizeof(recName), "Tour Test"); stopAndSaveRecording(); }
+            if (s == 20) playSet(setsDir() + "/Sunset to Jungle.set");
+            if (s == 27) engine.crossfader = 0.5f;  // touching a control takes over
+            if (s == 28) {
+                std::error_code ec;
+                fs::remove(setsDir() + "/Tour Test.set", ec);
+                sapp_request_quit();
+            }
         }
     }
 
@@ -587,6 +638,9 @@ void App::frame() {
     if (showHelp) drawHelpWindow();
     drawConfirmModal();
     drawToasts();
+    engine.endUserEdits();
+    updateSets();
+    startPendingReplay();
     lock.unlock();
 
     vis.uploadTextures();
@@ -718,7 +772,9 @@ static void event(const sapp_event* ev) {
     simgui_handle_event(ev);
 }
 
-sapp_desc sokol_main(int, char**) {
+sapp_desc sokol_main(int argc, char** argv) {
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--play-set") g_playSetArg = argv[i + 1];
     sapp_desc d{};
     d.init_cb = init;
     d.frame_cb = frame;
