@@ -1,6 +1,8 @@
 // Music visualisation: FFT analysis of the master output and several
 // audio-reactive display modes drawn with ImGui draw lists.
 #pragma once
+#include <array>
+#include <deque>
 #include <vector>
 
 #include "imgui.h"
@@ -14,7 +16,7 @@ public:
     static constexpr int kBars = 64;
     static constexpr int kSpecW = 512, kSpecH = 160;
 
-    enum Mode { Spectrum, Radial, Spectrogram, Vectorscope, Tunnel, Scope, NumModes };
+    enum Mode { Spectrum, Radial, Spectrogram, Sunset, Tunnel, Ridgeline, NumModes };
     static const char* modeName(int m);
 
     void init();
@@ -45,7 +47,8 @@ private:
         float x, y, vx, vy, life, maxLife, hue, size;
     };
     std::vector<Particle> particles_;
-    std::vector<std::vector<ImVec2>> trails_;  // vectorscope persistence
+    std::deque<std::array<float, kBars>> ridge_;  // spectrum history, newest first
+    float ridgeTimer_ = 0, starSpawn_ = 0, gridScroll_ = 0;
 
     std::vector<uint32_t> specPixels_ = std::vector<uint32_t>(size_t(kSpecW) * kSpecH, 0xFF000000u);
     int specCol_ = 0;
@@ -58,8 +61,8 @@ private:
     void drawSpectrum(ImDrawList* dl, ImVec2 p0, ImVec2 p1);
     void drawRadial(ImDrawList* dl, ImVec2 p0, ImVec2 p1);
     void drawSpectrogram(ImDrawList* dl, ImVec2 p0, ImVec2 p1);
-    void drawVectorscope(ImDrawList* dl, ImVec2 p0, ImVec2 p1);
+    void drawSunset(ImDrawList* dl, ImVec2 p0, ImVec2 p1);
     void drawTunnel(ImDrawList* dl, ImVec2 p0, ImVec2 p1);
-    void drawScope(ImDrawList* dl, ImVec2 p0, ImVec2 p1);
+    void drawRidgeline(ImDrawList* dl, ImVec2 p0, ImVec2 p1);
     void drawParticles(ImDrawList* dl, ImVec2 p0, ImVec2 p1, float dt);
 };

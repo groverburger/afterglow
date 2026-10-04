@@ -5,8 +5,11 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <thread>
 
 #include "Engine.h"
+#include "Library.h"
 #include "SetFile.h"
 #include "SynthGen.h"
 #include "Transitions.h"
@@ -110,7 +113,9 @@ int main() {
         double inFrac = inBeat - std::floor(inBeat);
         std::printf("  %-18s ok  (in deck at beat %.3f, eff bpm %.2f, peak %.2f)\n", def.name.c_str(), inBeat,
                     e.decks[1].effectiveBpm(), peak);
-        CHECK(std::fabs(e.decks[1].effectiveBpm() - 118.0) < 0.01, "%s: tempo not matched", def.name.c_str());
+        // A tempo glide hands over to the incoming track's own tempo; everything else keeps the outgoing one.
+        const double wantBpm = def.lane(Param::Tempo).enabled ? e.decks[1].track->bpm : 118.0;
+        CHECK(std::fabs(e.decks[1].effectiveBpm() - wantBpm) < 0.01, "%s: tempo not matched", def.name.c_str());
         (void)inFrac;
     }
 
@@ -168,6 +173,11 @@ int main() {
                     if (at(30.0)) e.jumpHotCue(1, 0);
                     if (at(31.0)) e.decks[1].echo = 0.7f;
                     if (at(32.0)) e.decks[1].echo = 0.0f;
+                    if (at(32.5)) e.decks[1].slip = true;
+                    if (t > 33.0 && t < 34.5) {                                 // scratch (as the waveform drag does, per UI frame)
+                        if (blk % 11 == 0) e.scratch(1, true, e.decks[1].slipPos + std::sin(t * 9.0) * 6000.0);
+                    }
+                    if (at(34.5)) e.scratch(1, false, 0);
                     e.endUserEdits();
                 }
                 e.render(buf.data(), 64, 2);
@@ -249,15 +259,54 @@ int main() {
 
         Engine f;
         f.loadTrack(0, tracks[4]);  // 138 trance
-        f.loadTrack(1, tracks[5]);  // 88 lofi -> ratio 1.57 or 0.78 -> not syncable within 12%
+        f.loadTrack(1, tracks[5]);  // 88 lofi -> ratio 1.57 or 0.78: a big (22%) stretch
         f.play(0);
         renderSeconds(f, 2.0);
         f.startTransition(defs[0], 0, &why);
         renderSeconds(f, 12.0);
         std::printf("trance 138 -> lofi 88: synced=%d note='%s' B rate %.3f\n", f.run.synced, f.transitionNote.c_str(),
                     f.decks[1].rate());
-        CHECK(!f.transitionNote.empty(), "expected no-sync note");
-        CHECK(std::fabs(f.decks[1].rate() - 1.0) < 1e-9, "unsynced deck should keep its tempo");
+        // A blend beat-matches anyway (it would trainwreck otherwise), but suggests Tempo Ramp.
+        CHECK(f.run.synced || f.decks[1].playing, "big-gap blend should beat-match");
+        CHECK(std::fabs(f.decks[1].effectiveBpm() * f.decks[1].syncFold - 138.0) < 0.01, "big-gap blend: B at %.2f", f.decks[1].effectiveBpm());
+        CHECK(f.transitionNote.find("Tempo Ramp") != std::string::npos, "expected a Tempo Ramp hint");
+
+        // A cut-style transition (Backspin) leaves the new track at its own tempo instead.
+        Engine g;
+        g.loadTrack(0, tracks[4]);
+        g.loadTrack(1, tracks[5]);
+        g.decks[1].tempo = 0;
+        g.play(0);
+        renderSeconds(g, 2.0);
+        g.decks[1].tempo = 0;  // undo the cued-deck pre-match (only happens within 16%, but be explicit)
+        g.startTransition(defs[4], 0, &why);
+        renderSeconds(g, 8.0);
+        std::printf("trance 138 -> lofi 88 (Backspin): B rate %.3f note='%s'\n", g.decks[1].rate(), g.transitionNote.c_str());
+        CHECK(std::fabs(g.decks[1].rate() - 1.0) < 1e-9, "cut transition should keep the new track's tempo");
+        CHECK(g.transitionNote.empty(), "cut transition shouldn't warn about tempo");
+
+        // Pressing SYNC by hand first is respected, and no warning is shown.
+        Engine h;
+        h.loadTrack(0, tracks[4]);
+        h.loadTrack(1, tracks[5]);
+        h.play(0);
+        renderSeconds(h, 2.0);
+        h.syncTempo(1, &why);
+        h.startTransition(defs[0], 0, &why);
+        renderSeconds(h, 12.0);
+        CHECK(h.transitionNote.empty(), "hand-synced deck got a note: %s", h.transitionNote.c_str());
+        CHECK(std::fabs(h.decks[1].effectiveBpm() * h.decks[1].syncFold - 138.0) < 0.01, "hand-synced: B at %.2f", h.decks[1].effectiveBpm());
+
+        // Sets recorded before 0.3 keep the old rule (no sync beyond 12%) so they replay as recorded.
+        Engine old;
+        old.legacyTransitionSync = true;
+        old.loadTrack(0, tracks[4]);
+        old.loadTrack(1, tracks[5]);
+        old.play(0);
+        renderSeconds(old, 2.0);
+        old.startTransition(defs[0], 0, &why);
+        renderSeconds(old, 12.0);
+        CHECK(std::fabs(old.decks[1].rate() - 1.0) < 1e-9, "legacy rule: unsynced deck should keep its tempo");
     }
 
     // Transition with nothing playing just starts the in deck.
@@ -286,13 +335,69 @@ int main() {
         e.exitLoop(0);
     }
 
+    // Scratching: the record follows the hand, stops when the hand stops, plays on after.
+    {
+        Engine e;
+        e.loadTrack(0, tracks[1]);
+        e.play(0);
+        renderSeconds(e, 2.0);
+        const double start = e.decks[0].pos;
+        e.scratch(0, true, start);  // hand down, holding still
+        renderSeconds(e, 0.3);
+        const double held = e.decks[0].pos;
+        renderSeconds(e, 0.5);
+        std::printf("scratch hold: moved %.1f frames while held\n", e.decks[0].pos - held);
+        CHECK(std::fabs(e.decks[0].pos - held) < 50.0, "record kept moving under the hand");
+        const double back = start - e.decks[0].framesPerBeat();
+        e.scratch(0, true, back);  // pull it back a beat
+        renderSeconds(e, 0.3);
+        CHECK(std::fabs(e.decks[0].pos - back) < 100.0, "scratch target not reached: %.0f vs %.0f", e.decks[0].pos, back);
+        e.scratch(0, false, 0);
+        const double released = e.decks[0].pos;
+        renderSeconds(e, 1.0);
+        double advanced = (e.decks[0].pos - released) / kSampleRate;
+        CHECK(std::fabs(advanced - 1.0) < 0.05 && e.decks[0].playing, "didn't play on after release (%.3fs)", advanced);
+
+        // Slip: scratch for a second, release, and it's where it would have been.
+        e.decks[0].slip = true;
+        const double before = e.decks[0].pos;
+        std::vector<float> buf(64 * 2);
+        for (int i = 0; i < kSampleRate / 64; ++i) {
+            if (i % 11 == 0) e.scratch(0, true, before - 20000.0 * std::sin(i * 0.05));
+            e.render(buf.data(), 64, 2);
+        }
+        e.scratch(0, false, 0);
+        const double expect = before + (kSampleRate / 64) * 64.0 * e.decks[0].rate();
+        std::printf("slip: %.0f frames from where it would have been\n", e.decks[0].pos - expect);
+        CHECK(std::fabs(e.decks[0].pos - expect) < 2.0, "slip lost its place by %.0f frames", e.decks[0].pos - expect);
+
+        // A paused record can be scratched too, and it is heard.
+        Engine p;
+        p.loadTrack(0, tracks[1]);
+        p.crossfader = 0.0f;
+        const double p0 = p.decks[0].frameOfBeat(32);
+        p.decks[0].pos = p0;
+        float peak = 0;
+        p.scratch(0, true, p0 + 30000.0);
+        renderSeconds(p, 0.5, &peak);
+        CHECK(peak > 0.01f, "paused scratch was silent");
+        CHECK(std::fabs(p.decks[0].pos - (p0 + 30000.0)) < 100.0 && !p.decks[0].playing, "paused scratch position");
+        p.scratch(0, false, 0);
+        const double rest = p.decks[0].pos;
+        renderSeconds(p, 0.3);
+        CHECK(p.decks[0].pos == rest, "paused deck moved after release");
+    }
+
     // Transition persistence round trip.
     {
         auto d = defs[1];
         d.stock = false;
         d.name = "Round \"Trip\"";
-        d.outEffect = OutEffect::Backspin;
+        d.outEffect = OutEffect::LoopRoll;
         d.outEffectAt = 0.25f;
+        d.inEffect = InEffect::SpinUp;
+        d.lane(Param::Tempo).enabled = true;
+        d.lane(Param::Tempo).keys = {{0, 0, CurveShape::Smooth}, {1, 1, CurveShape::Linear}};
         std::vector<TransitionDef> v{defs[0], d};
         const std::string pathStr = (std::filesystem::temp_directory_path() / "afterglow_tr_test.txt").string();
         const char* path = pathStr.c_str();
@@ -301,13 +406,79 @@ int main() {
         CHECK(back.size() == 1, "loaded %zu", back.size());
         if (back.size() == 1) {
             CHECK(back[0].name == d.name, "name '%s'", back[0].name.c_str());
-            CHECK(back[0].beats == d.beats && back[0].outEffect == d.outEffect, "fields");
+            CHECK(back[0].beats == d.beats && back[0].outEffect == d.outEffect && back[0].inEffect == d.inEffect, "fields");
             for (int p = 0; p < kNumParams; ++p) {
                 CHECK(back[0].lanes[p].enabled == d.lanes[p].enabled, "lane %d enabled", p);
                 for (float t = 0; t <= 1.0f; t += 0.05f)
                     CHECK(std::fabs(back[0].lanes[p].eval(t) - d.lanes[p].eval(t)) < 1e-4 || !d.lanes[p].enabled, "lane %d eval", p);
             }
         }
+    }
+
+    // Music folders: scan sub-folders, analyse once (cached), hide when the folder is removed.
+    {
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::temp_directory_path() / "afterglow_lib_test";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir / "Music" / "House" / "Deep", ec);
+        fs::create_directories(dir / "Music" / ".hidden", ec);
+        fs::create_directories(dir / "data", ec);
+        const Track& src = *tracks[1];
+        const size_t frames = size_t(kSampleRate) * 12;
+        writeWav((dir / "Music" / "Artist - Top Level.wav").string(), src.samples.data(), frames);
+        writeWav((dir / "Music" / "House" / "Deep" / "Nested.wav").string(), src.samples.data(), frames);
+        writeWav((dir / "Music" / ".hidden" / "Skip me.wav").string(), src.samples.data(), frames);
+        std::ofstream(dir / "Music" / "notes.txt") << "not audio";
+        const std::string root = (dir / "Music").string(), data = (dir / "data").string();
+        auto waitIdle = [](Library& lib) {
+            for (int i = 0; i < 2000 && (lib.scanning() || lib.busy()); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            for (int i = 0; i < 2000 && (lib.scanning() || lib.busy()); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        };
+        auto imported = [](Library& lib, std::vector<LibraryEntry*>* out) {
+            out->clear();
+            for (int i = 0; i < lib.size(); ++i)
+                if (lib.entry(i)->kind == EntryKind::Imported && !lib.entry(i)->hidden) out->push_back(lib.entry(i));
+        };
+        std::vector<LibraryEntry*> found;
+        {
+            Library lib;
+            lib.init(data + "/music", data + "/clips", data + "/cache.txt");
+            lib.setFolders({root});
+            waitIdle(lib);
+            imported(lib, &found);
+            CHECK(found.size() == 2, "folder scan found %zu files (want 2)", found.size());
+            for (auto* e : found) {
+                CHECK(e->bpm > 100 && e->bpm < 150, "%s: bpm %.1f", e->name.c_str(), e->bpm);
+                CHECK(!e->track, "%s: audio kept after analysis", e->name.c_str());
+                if (e->name == "Nested") CHECK(e->relDir == "House/Deep", "relDir '%s'", e->relDir.c_str());
+                if (e->name == "Top Level") CHECK(e->artist == "Artist", "artist '%s'", e->artist.c_str());
+            }
+            lib.setFolders({});
+            imported(lib, &found);
+            CHECK(found.empty(), "removed folder still shows %zu files", found.size());
+        }
+        {
+            // Second run: everything comes from the cache, nothing is re-analysed.
+            Library lib;
+            lib.init(data + "/music", data + "/clips", data + "/cache.txt");
+            lib.setFolders({root});
+            for (int i = 0; i < 200 && lib.scanning(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            imported(lib, &found);
+            CHECK(found.size() == 2 && lib.analysisPending() == 0, "cache: %zu files, %d pending", found.size(), lib.analysisPending());
+            for (auto* e : found) CHECK(e->bpm > 0 && e->lengthSec > 11.9, "cached %s: bpm %.1f len %.1f", e->name.c_str(), e->bpm, e->lengthSec);
+            // A deck asking for it gets the audio; the cached tempo is used.
+            int idx = -1;
+            for (int i = 0; i < lib.size(); ++i)
+                if (lib.entry(i)->name == "Nested") idx = i;
+            TrackPtr t;
+            for (int i = 0; i < 500 && !(t = lib.acquire(idx)); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            CHECK(t && std::fabs(t->bpm - lib.entry(idx)->bpm) < 1e-9, "acquire from folder");
+        }
+        fs::remove_all(dir, ec);
+        std::printf("music folders: ok\n");
     }
 
     std::printf(failures ? "\n%d FAILURES\n" : "\nALL TESTS PASSED\n", failures);

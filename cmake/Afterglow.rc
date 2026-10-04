@@ -1,0 +1,5 @@
+// Windows resources: app icon (also used for the window) and, for MinGW, the manifest.
+1 ICON "../assets/Afterglow.ico"
+#ifdef AFTERGLOW_RC_MANIFEST
+1 24 "Afterglow.manifest"
+#endif

@@ -69,7 +69,7 @@ float dbNorm(float mag) {
 }  // namespace
 
 const char* Visualizer::modeName(int m) {
-    static const char* names[NumModes] = {"Spectrum", "Radial Burst", "Spectrogram", "Vectorscope", "Tunnel", "Oscilloscope"};
+    static const char* names[NumModes] = {"Spectrum", "Radial Burst", "Spectrogram", "Sunset", "Tunnel", "Ridgeline"};
     return m >= 0 && m < NumModes ? names[m] : "?";
 }
 
@@ -113,6 +113,14 @@ void Visualizer::update(Engine& engine, float dt) {
         lastBeat_ = masterBeat;
     }
     hueShift_ += dt * (0.02f + 0.08f * bass);
+    ridgeTimer_ += dt;
+    if (ridgeTimer_ >= 1.0f / 24.0f) {
+        ridgeTimer_ = 0;
+        std::array<float, kBars> row;
+        std::copy(bars_, bars_ + kBars, row.begin());
+        ridge_.push_front(row);
+        if (ridge_.size() > 36) ridge_.pop_back();
+    }
     if (autoCycle) {
         cycleTimer_ += dt;
         if (cycleTimer_ > 15.0f) {
@@ -218,9 +226,9 @@ void Visualizer::draw(ImDrawList* dl, ImVec2 p0, ImVec2 p1, int m) {
         case Spectrum: drawSpectrum(dl, p0, p1); break;
         case Radial: drawRadial(dl, p0, p1); break;
         case Spectrogram: drawSpectrogram(dl, p0, p1); break;
-        case Vectorscope: drawVectorscope(dl, p0, p1); break;
+        case Sunset: drawSunset(dl, p0, p1); break;
         case Tunnel: drawTunnel(dl, p0, p1); break;
-        case Scope: drawScope(dl, p0, p1); break;
+        case Ridgeline: drawRidgeline(dl, p0, p1); break;
         default: break;
     }
     // Beat flash around the edge.
@@ -302,68 +310,122 @@ void Visualizer::drawSpectrogram(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
     }
 }
 
-void Visualizer::drawVectorscope(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
-    const ImVec2 c((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f);
-    const float s = std::min(p1.x - p0.x, p1.y - p0.y) * 0.42f;
-    dl->AddLine(ImVec2(c.x - s, c.y), ImVec2(c.x + s, c.y), IM_COL32(255, 255, 255, 30));
-    dl->AddLine(ImVec2(c.x, c.y - s), ImVec2(c.x, c.y + s), IM_COL32(255, 255, 255, 30));
-    dl->AddCircle(c, s, IM_COL32(255, 255, 255, 25), 64);
-    std::vector<ImVec2> pts;
-    const int n = 1024;
-    pts.reserve(n);
-    for (int i = kFftSize - n; i < kFftSize; ++i) {
-        float l = scope_[size_t(i) * 2], r = scope_[size_t(i) * 2 + 1];
-        float x = (l - r) * 0.7071f, y = (l + r) * 0.7071f;
-        pts.emplace_back(c.x + x * s * 1.2f, c.y - y * s * 1.2f);
+// Retro "afterglow" sunset: a striped sun over a spectrum skyline and a neon grid
+// floor that scrolls one line per beat.
+void Visualizer::drawSunset(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
+    const float w = p1.x - p0.x, h = p1.y - p0.y;
+    const float cx = (p0.x + p1.x) * 0.5f, horizon = p0.y + h * 0.62f;
+    const float dt = ImGui::GetIO().DeltaTime;
+
+    // Stars (fixed pseudo-random positions, twinkling).
+    for (int i = 0; i < 70; ++i) {
+        float sx = std::fmod(float(i) * 0.6180339f * 7.1f, 1.0f), sy = std::fmod(float(i) * 0.3819660f * 3.7f, 1.0f);
+        float tw = 0.5f + 0.5f * std::sin(time_ * (1.0f + float(i % 5) * 0.4f) + float(i));
+        dl->AddCircleFilled(ImVec2(p0.x + sx * w, p0.y + sy * (horizon - p0.y) * 0.8f), 1.0f + float(i % 3 == 0),
+                            IM_COL32(255, 230, 255, int(40 + 120 * tw * (0.4f + treble))), 6);
     }
-    trails_.push_back(std::move(pts));
-    if (trails_.size() > 6) trails_.erase(trails_.begin());
-    for (size_t k = 0; k < trails_.size(); ++k) {
-        float a = float(k + 1) / float(trails_.size());
-        ImU32 col = ui::hsv(hueShift_ + 0.45f + a * 0.1f, 0.6f, 1.0f, a * a * 0.8f);
-        dl->AddPolyline(trails_[k].data(), int(trails_[k].size()), col, 0, 1.0f + a);
+
+    // Sun: glow, then horizontal slices from yellow to hot pink with retro gaps near the bottom.
+    const float R = std::min(w, h) * 0.26f * (1.0f + bass * 0.06f + beatPulse * 0.03f);
+    const ImVec2 sc(cx, horizon - R * 0.35f);
+    for (int i = 0; i < 7; ++i)
+        dl->AddCircleFilled(sc, R * (1.15f + i * 0.16f), ui::hsv(0.93f + i * 0.01f, 0.8f, 1.0f, 0.035f + 0.03f * bass), 64);
+    const int slices = 64;
+    for (int k = 0; k < slices; ++k) {
+        float y0 = sc.y - R + 2 * R * float(k) / slices, y1 = y0 + 2 * R / slices + 0.5f;
+        if (y0 > horizon) break;
+        float u = float(k) / slices;  // 0 top .. 1 bottom
+        // Gaps widen towards the bottom and breathe with the beat.
+        if (u > 0.5f) {
+            float band = std::fmod((u - 0.5f) * 10.0f + gridScroll_ * 0.25f, 1.0f);
+            if (band < 0.25f + (u - 0.5f) * 0.9f * (0.8f + 0.4f * beatPulse)) continue;
+        }
+        float mid = (y0 + y1) * 0.5f - sc.y;
+        float half = std::sqrt(std::max(0.0f, R * R - mid * mid));
+        ImU32 col = ui::hsv(0.13f - 0.2f * u, 0.75f + 0.2f * u, 1.0f);
+        dl->AddRectFilled(ImVec2(cx - half, y0), ImVec2(cx + half, std::min(y1, horizon)), col);
     }
-    dl->AddText(ImVec2(c.x - s, c.y - s), IM_COL32(255, 255, 255, 110), "L");
-    dl->AddText(ImVec2(c.x + s - 8, c.y - s), IM_COL32(255, 255, 255, 110), "R");
+
+    // Skyline: the spectrum as a mirrored city silhouette on the horizon.
+    const float bw = w / (kBars * 2);
+    for (int i = 0; i < kBars * 2; ++i) {
+        int bi = i < kBars ? kBars - 1 - i : i - kBars;  // bass in the middle
+        float bh = (0.02f + bars_[bi] * 0.9f) * h * 0.2f;
+        float x0 = p0.x + i * bw, x1 = x0 + bw + 0.5f;
+        ImU32 top = ui::hsv(hueShift_ + 0.78f, 0.7f, 0.25f), bot = ui::hsv(hueShift_ + 0.75f, 0.8f, 0.08f);
+        dl->AddRectFilledMultiColor(ImVec2(x0, horizon - bh), ImVec2(x1, horizon), top, top, bot, bot);
+        dl->AddLine(ImVec2(x0, horizon - bh), ImVec2(x1, horizon - bh), ui::hsv(0.9f, 0.6f, 1.0f, 0.55f + 0.4f * bars_[bi]), 1.5f);
+    }
+
+    // Floor.
+    ImU32 f0 = ui::hsv(hueShift_ + 0.75f, 0.9f, 0.10f), f1 = ui::hsv(hueShift_ + 0.8f, 0.9f, 0.02f);
+    dl->AddRectFilledMultiColor(ImVec2(p0.x, horizon), p1, f0, f0, f1, f1);
+    dl->AddLine(ImVec2(p0.x, horizon), ImVec2(p1.x, horizon), ui::hsv(0.9f, 0.5f, 1.0f, 0.9f), 2.0f);
+    // Horizontal grid lines move toward the viewer, one line per beat while music plays.
+    if (masterPlaying) gridScroll_ = float(masterBeat - std::floor(masterBeat / 64.0) * 64.0);
+    else gridScroll_ += dt * 0.3f;
+    const float phase = gridScroll_ - std::floor(gridScroll_);
+    const float floorH = p1.y - horizon;
+    const ImU32 neon = ui::hsv(0.88f + 0.05f * mids, 0.75f, 1.0f);
+    for (int k = 1; k < 24; ++k) {
+        float d = float(k) - phase;  // depth, 1 = nearest
+        if (d <= 0.05f) continue;
+        float y = horizon + floorH * 0.9f / d;
+        if (y > p1.y) continue;
+        float a = std::clamp(1.2f / d, 0.08f, 1.0f) * (0.6f + 0.4f * beatPulse);
+        dl->AddLine(ImVec2(p0.x, y), ImVec2(p1.x, y), ui::withAlpha(neon, a), 1.0f + 1.5f / d);
+    }
+    for (int j = -16; j <= 16; ++j) {
+        float xb = cx + float(j) * w * 0.12f, xt = cx + float(j) * w * 0.012f;
+        dl->AddLine(ImVec2(xt, horizon), ImVec2(xb, p1.y), ui::withAlpha(neon, 0.55f), 1.2f);
+    }
 }
 
 void Visualizer::drawTunnel(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
-    const ImVec2 c((p0.x + p1.x) * 0.5f + std::sin(time_ * 0.7f) * 20.0f, (p0.y + p1.y) * 0.5f + std::cos(time_ * 0.5f) * 14.0f);
+    // Calm by design: slow drift that swells gently with the (smoothed) bass, so it
+    // stays easy on the eyes in fullscreen.
+    const float size = std::min(p1.x - p0.x, p1.y - p0.y);
+    const ImVec2 c((p0.x + p1.x) * 0.5f + std::sin(time_ * 0.35f) * size * 0.02f,
+                   (p0.y + p1.y) * 0.5f + std::cos(time_ * 0.25f) * size * 0.015f);
     const float maxR = std::hypot(p1.x - p0.x, p1.y - p0.y) * 0.6f;
     const float dt = ImGui::GetIO().DeltaTime;
-    tunnelZ_ += dt * (0.25f + bass * 1.2f + beatPulse * 0.3f);
-    const int rings = 18, sides = 8;
+    tunnelZ_ += dt * (0.06f + bassAvg_ * 0.22f + beatPulse * 0.04f);
+    const int rings = 16, sides = 8;
     for (int k = 0; k < rings; ++k) {
         float s = std::fmod(float(k) / rings + tunnelZ_, 1.0f);  // 0 far .. 1 near
         float r = maxR * s * s * s;
-        float rot = time_ * 0.25f + s * 1.5f;
+        float rot = time_ * 0.1f + s * 1.2f;
         ImVec2 pts[sides];
         for (int j = 0; j < sides; ++j) {
             float v = bars_[(j * 7 + k * 3) % kBars];
             float a = rot + j * 2.0f * kPi / sides;
-            float rr = r * (1.0f + v * 0.35f);
+            float rr = r * (1.0f + v * 0.2f);
             pts[j] = ImVec2(c.x + std::cos(a) * rr, c.y + std::sin(a) * rr);
         }
-        ImU32 col = ui::hsv(hueShift_ + s * 0.4f + k * 0.03f, 0.85f, 1.0f, s * 0.9f);
-        dl->AddPolyline(pts, sides, col, ImDrawFlags_Closed, 1.0f + 4.0f * s);
+        // Fade in from the distance and out again as rings pass the viewer.
+        float alpha = s * (1.0f - s * s) * 1.6f;
+        ImU32 col = ui::hsv(hueShift_ + s * 0.4f + k * 0.03f, 0.75f, 1.0f, std::clamp(alpha, 0.0f, 0.75f));
+        dl->AddPolyline(pts, sides, col, ImDrawFlags_Closed, 1.0f + 2.0f * s);
     }
-    // Star streaks flying out of the centre.
-    if (particles_.size() < 600) {
-        int spawn = 2 + int(bass * 10 + kick * 20);
-        for (int i = 0; i < spawn; ++i) {
-            float a = float(std::rand()) / float(RAND_MAX) * 2.0f * kPi;
-            float sp = 60.0f + float(std::rand() % 200);
-            particles_.push_back({c.x, c.y, std::cos(a) * sp, std::sin(a) * sp, 2.0f, 2.0f, hueShift_ + 0.5f, 1.0f});
-        }
+    // A few slow star streaks drifting out of the centre.
+    const float scale = size / 600.0f;
+    starSpawn_ += dt * (12.0f + 30.0f * bassAvg_);
+    while (starSpawn_ >= 1.0f && particles_.size() < 220) {
+        starSpawn_ -= 1.0f;
+        float a = float(std::rand()) / float(RAND_MAX) * 2.0f * kPi;
+        float sp = (25.0f + float(std::rand() % 60)) * scale;
+        particles_.push_back({c.x, c.y, std::cos(a) * sp, std::sin(a) * sp, 4.0f, 4.0f, hueShift_ + 0.5f, 1.0f});
     }
+    starSpawn_ = std::min(starSpawn_, 1.0f);
     for (auto& p : particles_) {
         float ox = p.x, oy = p.y;
-        p.vx *= 1.0f + dt * 2.2f;
-        p.vy *= 1.0f + dt * 2.2f;
+        p.vx *= 1.0f + dt * 0.9f;
+        p.vy *= 1.0f + dt * 0.9f;
         p.x += p.vx * dt;
         p.y += p.vy * dt;
         p.life -= dt;
-        dl->AddLine(ImVec2(ox, oy), ImVec2(p.x, p.y), ui::hsv(p.hue, 0.3f, 1.0f, std::min(1.0f, (2.0f - p.life))), 1.5f);
+        float fade = std::min(1.0f, (4.0f - p.life) * 0.6f) * 0.6f;
+        dl->AddLine(ImVec2(ox, oy), ImVec2(p.x, p.y), ui::hsv(p.hue, 0.3f, 1.0f, fade), 1.2f);
     }
     particles_.erase(std::remove_if(particles_.begin(), particles_.end(),
                                     [&](const Particle& p) {
@@ -373,27 +435,36 @@ void Visualizer::drawTunnel(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
                      particles_.end());
 }
 
-void Visualizer::drawScope(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
-    const int n = 1024;
-    // Trigger on a rising zero crossing so the trace stands still.
-    int start = kFftSize - n;
-    for (int i = kFftSize - n; i > 1; --i) {
-        float a = scope_[size_t(i - 1) * 2] + scope_[size_t(i - 1) * 2 + 1];
-        float b = scope_[size_t(i) * 2] + scope_[size_t(i) * 2 + 1];
-        if (a < 0 && b >= 0) {
-            start = i;
-            break;
+// Stacked spectrum history receding into the distance (bass in the middle), each
+// ridge hiding the ones behind it.
+void Visualizer::drawRidgeline(ImDrawList* dl, ImVec2 p0, ImVec2 p1) {
+    const float w = p1.x - p0.x, h = p1.y - p0.y;
+    const float cx = (p0.x + p1.x) * 0.5f;
+    const int rows = int(ridge_.size());
+    const int pts = 96;
+    std::vector<ImVec2> line(pts);
+    const ImU32 fill = ui::hsv(hueShift_ + 0.7f, 0.7f, 0.035f);
+    for (int k = rows - 1; k >= 0; --k) {
+        const auto& row = ridge_[size_t(k)];
+        float z = float(k) / 35.0f;                 // 0 front .. 1 back
+        float scale = 1.0f - 0.5f * z;
+        float width = w * 0.86f * scale;
+        float base = p0.y + h * (0.93f - 0.62f * z);
+        float amp = h * 0.32f * scale;
+        for (int i = 0; i < pts; ++i) {
+            float u = float(i) / float(pts - 1) * 2.0f - 1.0f;  // -1 .. 1
+            float fb = std::fabs(u) * float(kBars - 1);
+            int b0 = int(fb);
+            int b1 = std::min(kBars - 1, b0 + 1);
+            float v = row[size_t(b0)] + (row[size_t(b1)] - row[size_t(b0)]) * (fb - float(b0));
+            float env = 1.0f - u * u * u * u;       // quiet edges
+            line[size_t(i)] = ImVec2(cx + u * width * 0.5f, base - v * v * amp * env);
         }
+        for (int i = 0; i + 1 < pts; ++i)
+            dl->AddQuadFilled(line[size_t(i)], line[size_t(i) + 1], ImVec2(line[size_t(i) + 1].x, base + 1),
+                              ImVec2(line[size_t(i)].x, base + 1), fill);
+        float a = (1.0f - z) * (1.0f - z);
+        ImU32 col = k == 0 ? IM_COL32(255, 255, 255, 235) : ui::hsv(hueShift_ + 0.5f + z * 0.35f, 0.7f, 1.0f, 0.25f + 0.7f * a);
+        dl->AddPolyline(line.data(), pts, col, 0, k == 0 ? 2.5f : 1.0f + 1.2f * a);
     }
-    const float midY = (p0.y + p1.y) * 0.5f, h = (p1.y - p0.y) * 0.45f;
-    std::vector<ImVec2> pts(n);
-    for (int i = 0; i < n; ++i) {
-        size_t k = size_t(std::min(kFftSize - 1, start + i));
-        float v = 0.5f * (scope_[k * 2] + scope_[k * 2 + 1]);
-        pts[size_t(i)] = ImVec2(p0.x + (p1.x - p0.x) * i / (n - 1), midY - v * h * 1.6f);
-    }
-    ImU32 col = ui::hsv(hueShift_ + 0.35f, 0.7f, 1.0f);
-    dl->AddPolyline(pts.data(), n, ui::withAlpha(col, 0.12f), 0, 9.0f);
-    dl->AddPolyline(pts.data(), n, ui::withAlpha(col, 0.3f), 0, 4.0f);
-    dl->AddPolyline(pts.data(), n, IM_COL32(255, 255, 255, 230), 0, 1.5f);
 }

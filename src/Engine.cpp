@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -11,7 +12,27 @@ constexpr double kBrakeSeconds = 1.4;
 constexpr double kSpinWindup = 0.07;    // seconds to reach full reverse speed
 constexpr double kSpinSpeed = -4.0;
 constexpr double kMaxSyncChange = 0.5;  // never sync further than +/-50 %
-constexpr double kTransitionSyncLimit = 0.12;
+constexpr double kTransitionSyncLimit = 0.12;  // tempo gap non-blending transitions still match
+constexpr double kBigTempoChange = 0.16;
+constexpr double kSpinUpSeconds = 0.45;  // turntable start: 0 to full speed
+// Scratching: the playhead chases the hand with a short lag, and its speed is
+// smoothed a little so 60 Hz mouse updates don't sound like a zipper.
+constexpr double kScratchLag = 0.018;
+constexpr double kScratchSmooth = 0.02;
+constexpr double kMaxScratchRate = 12.0;
+
+// Smallest tempo slider range that shows `tempo`.
+float tempoRangeFor(double tempo) {
+    const double a = std::fabs(tempo);
+    return a <= 0.08 ? 0.08f : a <= 0.16 ? 0.16f : 0.5f;
+}
+
+// Frames the incoming deck advances between starting and the end of the blend.
+double inPlayFrames(const TransitionDef& def, const Deck& in, double length, double inRate, double inStart, bool synced) {
+    // A tempo glide runs on the outgoing track's beats; a synced deck plays a fixed number of its own beats.
+    if (def.lane(Param::Tempo).enabled && synced) return (1.0 - inStart) * def.beats / in.syncFold * in.framesPerBeat();
+    return (1.0 - inStart) * length * inRate;
+}
 
 double wrapBar(double x) {
     // Wrap into [-2, 2) beats.
@@ -154,6 +175,7 @@ void Engine::renderBlock(float* out, int frames) {
         replayClock += uint64_t(frames);
         if (replayNext >= replay.events.size() && replayClock >= replay.lengthFrames) {
             replayActive_ = false;
+            legacyTransitionSync = false;
             replayFinished = true;
         }
     }
@@ -178,9 +200,23 @@ void Engine::renderDeck(Deck& dk, float* mix, int frames, float xfg) {
     float peak = 0;
     for (int i = 0; i < frames; ++i) {
         float l = 0, r = 0;
-        if (dk.playing) {
+        if (dk.scratching) {
+            double want = std::clamp((dk.scratchTarget - dk.pos) / (kScratchLag * kSampleRate), -kMaxScratchRate, kMaxScratchRate);
+            dk.scratchRate += (want - dk.scratchRate) * kScratchSmooth;
+            if (dk.pos >= 0 && dk.pos < lastFrame) {
+                l = readFrame(t, dk.pos, 0);
+                r = readFrame(t, dk.pos, 1);
+            }
+            dk.pos = std::clamp(dk.pos + dk.scratchRate, -10.0 * kSampleRate, lastFrame);
+            if (dk.slip && dk.playing) dk.slipPos += dk.rate();
+        } else if (dk.playing) {
             double rr = dk.rate();
-            if (dk.motion == Motion::Brake) {
+            if (dk.motion == Motion::SpinUp) {
+                dk.motionTime += 1.0 / kSampleRate;
+                double a = dk.motionTime / kSpinUpSeconds;
+                rr *= std::min(1.0, a);
+                if (a >= 1.0) dk.motion = Motion::Normal;
+            } else if (dk.motion == Motion::Brake) {
                 dk.motionTime += 1.0 / kSampleRate;
                 double m = 1.0 - dk.motionTime / kBrakeSeconds;
                 rr = dk.motionStartRate * std::max(0.0, m);
@@ -280,6 +316,7 @@ void Engine::loadTrack(int d, TrackPtr t) {
     dk.tempo = 0;
     dk.tempoRange = 0.08f;
     dk.syncFold = 1.0;
+    dk.scratching = false;
     for (int i = 0; i < kNumHotCues; ++i) dk.hotCueSet[i] = false;
     // Start at the first downbeat so "play" always lands on the grid.
     dk.cuePoint = dk.track ? std::max(0.0, dk.track->firstBeatSec * kSampleRate) : 0.0;
@@ -426,6 +463,26 @@ void Engine::startMotion(int d, Motion m) {
     dk.loopActive = false;
 }
 
+void Engine::scratch(int d, bool held, double target) {
+    RECORD_CALL(SetAction::Scratch, d, 0, target, 0, held);
+    Deck& dk = decks[d];
+    if (!dk.loaded()) return;
+    if (held) {
+        if (!dk.scratching) {
+            dk.scratching = true;
+            dk.scratchRate = dk.playing ? dk.rate() : 0.0;  // the record was moving under the hand
+            dk.slipPos = dk.pos;
+            dk.motion = Motion::Normal;
+            dk.loopActive = false;
+        }
+        dk.scratchTarget = target;
+        return;
+    }
+    if (!dk.scratching) return;
+    dk.scratching = false;
+    if (dk.slip && dk.playing) dk.pos = std::min(dk.slipPos, double(dk.track->frames()) - 1);
+}
+
 bool Engine::computeSync(int d, double* ratio, double* fold) const {
     const Deck& dk = decks[d];
     const Deck& o = decks[otherDeck(d)];
@@ -559,9 +616,22 @@ double Engine::landingPreRoll(const TransitionDef& def, int inDeck) const {
     // Predict the tempo the incoming deck will run at once the transition syncs it.
     double inRate = in.rate();
     double ratio, fold;
-    if (outRunning && !in.playing && computeSync(inDeck, &ratio, &fold) && std::fabs(ratio - 1.0) <= kTransitionSyncLimit)
+    if (outRunning && !in.playing && planTransitionSync(def, inDeck, &ratio, &fold)) {
+        if (def.lane(Param::Tempo).enabled) return (1.0 - inStart) * def.beats / fold * in.framesPerBeat();
         inRate = ratio;
-    return (1.0 - inStart) * length * inRate;
+    }
+    return inPlayFrames(def, in, length, inRate, inStart, false);
+}
+
+bool Engine::planTransitionSync(const TransitionDef& def, int inDeck, double* ratio, double* fold) const {
+    const Deck& in = decks[inDeck];
+    if (!computeSync(inDeck, ratio, fold)) return false;
+    const double change = std::fabs(*ratio - 1.0);
+    if (legacyTransitionSync) return change <= kTransitionSyncLimit;
+    if (!in.sync || change > kMaxSyncChange) return false;
+    // Already matched by hand or with SYNC: respect it, however big the change.
+    const bool matched = std::fabs((1.0 + in.tempo) / *ratio - 1.0) < 0.002;
+    return matched || change <= kTransitionSyncLimit || def.overlaps();
 }
 
 void Engine::cancelTransition() {
@@ -586,16 +656,39 @@ void Engine::updateTransition(int frames) {
     float t = run.length > 0 ? float(std::min(1.0, run.elapsed / run.length)) : 1.0f;
     if (!run.inStarted && t >= run.def.inStartAt) startIncoming();
     if (!run.fxFired && run.def.outEffect != OutEffect::None && t >= run.def.outEffectAt) {
-        startMotion(run.out, run.def.outEffect == OutEffect::Brake ? Motion::Brake : Motion::Backspin);
+        if (run.def.outEffect != OutEffect::LoopRoll)
+            startMotion(run.out, run.def.outEffect == OutEffect::Brake ? Motion::Brake : Motion::Backspin);
         run.fxFired = true;
     }
+    if (run.fxFired && run.def.outEffect == OutEffect::LoopRoll) updateRoll(t);
     applyLanes(t);
     run.progress = t;
     if (t >= 1.0f) {
         finishTransition();
         return;
     }
-    run.elapsed += frames;
+    // During a tempo glide the clock follows the outgoing track's beats, so the blend still ends on a bar.
+    const Deck& o = decks[run.out];
+    if (run.outBpmAtStart > 0 && o.loaded() && o.playing && o.motion == Motion::Normal)
+        run.elapsed += frames * (o.track->bpm * (1.0 + o.tempo)) / run.outBpmAtStart;
+    else
+        run.elapsed += frames;
+}
+
+void Engine::updateRoll(float t) {
+    // 1 beat, 1/2, 1/4, 1/8: four equal stages from the effect point to the end.
+    Deck& o = decks[run.out];
+    if (!o.loaded() || !o.playing || o.scratching) return;
+    const float span = 1.0f - run.def.outEffectAt;
+    const float u = span > 1e-4f ? (t - run.def.outEffectAt) / span : 1.0f;
+    const float beats = 1.0f / float(1 << std::clamp(int(u * 4.0f), 0, 3));
+    if (beats == run.rollBeats) return;
+    if (run.rollBeats == 0) o.loopIn = std::max(0.0, o.frameOfBeat(std::floor(o.beatPos() + 1e-6)));
+    o.loopOut = o.loopIn + beats * o.framesPerBeat();
+    o.loopBeats = beats;
+    o.loopActive = true;
+    if (o.pos >= o.loopOut) o.pos = o.loopIn + std::fmod(o.pos - o.loopIn, o.loopOut - o.loopIn);
+    run.rollBeats = beats;
 }
 
 void Engine::beginTransitionNow() {
@@ -609,6 +702,8 @@ void Engine::beginTransitionNow() {
     run.length = run.def.beats * run.framesPerBeat;
     run.outBeatAtStart = outRunning ? std::round(o.beatPos()) : 0.0;
     run.synced = false;
+    run.rollBeats = 0;
+    run.outBpmAtStart = run.inTargetBpm = 0;
     if (!outRunning) {
         // Nothing to mix out of: just bring the new track in right away.
         run.def.inStartAt = 0.0f;
@@ -619,24 +714,45 @@ void Engine::beginTransitionNow() {
         // Fresh channel for the incoming track (lanes override where they apply).
         in.resetMixer();
         in.motion = Motion::Normal;
+        const bool glide = outRunning && run.def.lane(Param::Tempo).enabled;
+        double inRate = in.rate();
         if (outRunning) {
             double ratio, fold;
-            if (computeSync(run.in, &ratio, &fold) && std::fabs(ratio - 1.0) <= kTransitionSyncLimit) {
+            const bool matched = computeSync(run.in, &ratio, &fold) && std::fabs((1.0 + in.tempo) / ratio - 1.0) < 0.002;
+            if (planTransitionSync(run.def, run.in, &ratio, &fold)) {
                 in.tempo = ratio - 1.0;
                 in.syncFold = fold;
-                in.tempoRange = std::max(in.tempoRange, std::fabs(float(in.tempo)) <= 0.08f ? 0.08f : 0.16f);
+                in.tempoRange = std::max(in.tempoRange, tempoRangeFor(in.tempo));
+                inRate = ratio;
                 run.synced = true;
-            } else {
+                if (!legacyTransitionSync && !matched && !glide && std::fabs(in.tempo) > kBigTempoChange) {
+                    char buf[160];
+                    std::snprintf(buf, sizeof(buf), "Deck %c is %s %.0f%% to beat-match. For big tempo jumps, try the Tempo Ramp transition",
+                                  'A' + run.in, in.tempo > 0 ? "sped up" : "slowed down", std::fabs(in.tempo) * 100.0);
+                    transitionNote = buf;
+                }
+            } else if (legacyTransitionSync) {
                 transitionNote = "Tempos too different to beatmatch - mixing without sync";
+            } else if (in.sync && run.def.overlaps()) {
+                transitionNote = "Tempos are too far apart to beat-match - try Echo Out, Backspin or Power Swap";
+            }
+            if (glide) {
+                run.outBpmAtStart = o.track->bpm * (1.0 + o.tempo);
+                double r, f;
+                run.inTargetBpm = computeSync(run.in, &r, &f) ? in.track->bpm * (run.synced ? in.syncFold : f) : 0.0;
             }
         }
         if (run.land) {
             // Rewind so the cued spot arrives exactly as the blend completes.
-            in.pos -= (1.0 - run.def.inStartAt) * run.length * in.rate();
+            in.pos -= inPlayFrames(run.def, in, run.length, inRate, run.def.inStartAt, run.synced);
             in.loopActive = false;
         }
     } else {
         run.synced = in.sync;
+        if (outRunning && run.def.lane(Param::Tempo).enabled && in.loaded()) {
+            run.outBpmAtStart = o.track->bpm * (1.0 + o.tempo);
+            run.inTargetBpm = in.track->bpm * (run.synced ? in.syncFold : 1.0);
+        }
     }
     applyLanes(0.0f);
 }
@@ -647,12 +763,20 @@ void Engine::startIncoming() {
     run.inStarted = true;
     if (in.playing) return;
     if (run.synced) {
-        double masterBeat = (o.playing && o.motion == Motion::Normal)
+        // A braked, spun or loop-rolled out deck is off its grid: use the transition's own clock.
+        const bool rolling = run.def.outEffect == OutEffect::LoopRoll && run.fxFired;
+        double masterBeat = (o.playing && o.motion == Motion::Normal && !rolling)
                                 ? o.beatPos()
                                 : run.outBeatAtStart + run.elapsed / run.framesPerBeat;
         alignPhase(run.in, masterBeat, in.syncFold, !run.land);
     }
     in.motion = Motion::Normal;
+    if (run.def.inEffect == InEffect::SpinUp) {
+        // It starts slow: begin a little ahead so it's on the beat once up to speed.
+        in.motion = Motion::SpinUp;
+        in.motionTime = 0;
+        in.pos += 0.5 * kSpinUpSeconds * kSampleRate * in.rate();
+    }
     in.playing = true;
 }
 
@@ -690,6 +814,14 @@ void Engine::applyLanes(float t) {
             case Param::InFilter: in.filter = v; break;
             case Param::OutEcho: o.echo = v; break;
             case Param::InEcho: in.echo = v; break;
+            case Param::Tempo:
+                if (run.outBpmAtStart > 0 && run.inTargetBpm > 0 && o.loaded()) {
+                    const double bpm = run.outBpmAtStart + (run.inTargetBpm - run.outBpmAtStart) * double(v);
+                    o.tempo = bpm / o.track->bpm - 1.0;
+                    o.tempoRange = std::max(o.tempoRange, tempoRangeFor(o.tempo));
+                    if (run.synced && in.loaded()) in.tempo = bpm / (in.track->bpm * in.syncFold) - 1.0;
+                }
+                break;
             case Param::Count: break;
         }
     }
@@ -778,6 +910,7 @@ double Engine::getParam(int deck, SetParam p) const {
         case SetParam::Sync: return dk.sync ? 1.0 : 0.0;
         case SetParam::Nudge: return dk.nudge;
         case SetParam::CuePoint: return dk.cuePoint;
+        case SetParam::Slip: return dk.slip ? 1.0 : 0.0;
         case SetParam::Crossfader: return crossfader;
         case SetParam::XfCurve: return xfCurve;
         case SetParam::MasterVolume: return masterVolume;
@@ -802,6 +935,7 @@ void Engine::setParam(int deck, SetParam p, double v) {
         case SetParam::Sync: dk.sync = v != 0.0; break;
         case SetParam::Nudge: dk.nudge = v; break;
         case SetParam::CuePoint: dk.cuePoint = v; break;
+        case SetParam::Slip: dk.slip = v != 0.0; break;
         case SetParam::Crossfader: crossfader = float(v); break;
         case SetParam::XfCurve: xfCurve = int(v); break;
         case SetParam::MasterVolume: masterVolume = float(v); break;
@@ -907,6 +1041,7 @@ void Engine::startReplay(SetRecording set) {
         dk.playing = false;
         dk.motion = Motion::Normal;
         dk.nudge = 0;
+        dk.scratching = false;
     }
     previewing = false;
     replay = std::move(set);
@@ -916,10 +1051,14 @@ void Engine::startReplay(SetRecording set) {
     replayFinished = false;
     tookOver = false;
     replayNotes.clear();
+    legacyTransitionSync = replay.version < 2;
     replayActive_ = true;
 }
 
-void Engine::stopReplay() { replayActive_ = false; }
+void Engine::stopReplay() {
+    replayActive_ = false;
+    legacyTransitionSync = false;
+}
 
 void Engine::runReplay() {
     replayStalled = false;
@@ -962,7 +1101,8 @@ void Engine::applyEvent(const SetEvent& ev) {
         case SetAction::Loop: setLoop(d, float(ev.value)); break;
         case SetAction::LoopExit: exitLoop(d); break;
         case SetAction::LoopRange: setLoopRange(d, ev.value, ev.value2); break;
-        case SetAction::Motion: startMotion(d, Motion(std::clamp(ev.param, 0, 2))); break;
+        case SetAction::Motion: startMotion(d, Motion(std::clamp(ev.param, 0, 3))); break;
+        case SetAction::Scratch: scratch(d, ev.flag, ev.value); break;
         case SetAction::SyncTempo: syncTempo(d, nullptr); break;
         case SetAction::AlignPhase: alignPhase(d, ev.value, ev.value2, ev.flag); break;
         case SetAction::Transition: startTransition(ev.def, d, nullptr, ev.flag); break;

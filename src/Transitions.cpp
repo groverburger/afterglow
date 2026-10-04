@@ -22,6 +22,7 @@ const ParamInfo kParamInfo[kNumParams] = {
     {"Out High EQ", "out_high", 0.5f}, {"In High EQ", "in_high", 0.5f},
     {"Out Filter", "out_filter", 0.5f}, {"In Filter", "in_filter", 0.5f},
     {"Out Echo", "out_echo", 0.0f},   {"In Echo", "in_echo", 0.0f},
+    {"Tempo Glide", "tempo", 0.0f},
 };
 
 float smoothstep(float x) { return x * x * (3 - 2 * x); }
@@ -44,6 +45,7 @@ struct Builder {
     }
     Builder& inStart(float t) { d.inStartAt = t; return *this; }
     Builder& outFx(OutEffect e, float t) { d.outEffect = e; d.outEffectAt = t; return *this; }
+    Builder& inFx(InEffect e) { d.inEffect = e; return *this; }
 };
 
 constexpr CurveShape L = CurveShape::Linear;
@@ -79,6 +81,7 @@ const char* effectId(OutEffect e) {
     switch (e) {
         case OutEffect::Brake: return "brake";
         case OutEffect::Backspin: return "backspin";
+        case OutEffect::LoopRoll: return "roll";
         default: return "none";
     }
 }
@@ -181,6 +184,77 @@ std::vector<TransitionDef> makeStockTransitions() {
                     .keys(Param::OutVolume, {{0, 1, L}, {0.7f, 1, S}, {0.8f, 0, L}, {1, 0, L}})
                     .keys(Param::Crossfader, {{0, 0, S}, {0.5f, 0.5f, S}, {0.8f, 1, L}, {1, 1, L}})
                     .d);
+
+    // Added in 0.3 - appended so older saves and sets keep their indices.
+    v.push_back(Builder("Tempo Ramp", "For tracks with different tempos: blends while the tempo glides from the old "
+                                      "track's BPM to the new one's, so neither track sounds stretched for long.", 32)
+                    .keys(Param::Crossfader, {{0, 0, S}, {0.2f, 0.5f, L}, {0.8f, 0.5f, S}, {1, 1, L}})
+                    .keys(Param::InLow, {{0, 0, H}, {0.5f, 0.5f, L}, {1, 0.5f, L}})
+                    .keys(Param::OutLow, {{0, 0.5f, H}, {0.5f, 0, L}, {1, 0, L}})
+                    .keys(Param::Tempo, {{0, 0, S}, {0.1f, 0, S}, {0.9f, 1, L}, {1, 1, L}})
+                    .d);
+
+    v.push_back(Builder("Loop Roll", "The old track stutters into a tightening loop roll (1 beat, 1/2, 1/4, 1/8) "
+                                     "under a rising filter, then the new track drops.", 8)
+                    .keys(Param::OutFilter, {{0, 0.5f, L}, {0.5f, 0.5f, S}, {1, 0.8f, L}})
+                    .keys(Param::Crossfader, {{0, 0, H}, {0.99f, 1, L}, {1, 1, L}})
+                    .outFx(OutEffect::LoopRoll, 0.5f)
+                    .inStart(1.0f)
+                    .d);
+
+    v.push_back(Builder("Power Swap", "The old record grinds to a halt, then the new one spins up from a standstill "
+                                      "like a turntable switched on. Works across any tempo.", 4)
+                    .keys(Param::Crossfader, {{0, 0, H}, {0.75f, 1, L}, {1, 1, L}})
+                    .outFx(OutEffect::Brake, 0.0f)
+                    .inFx(InEffect::SpinUp)
+                    .inStart(0.75f)
+                    .d);
+
+    v.push_back(Builder("Three-Band Swap", "Hands over one EQ band at a time: the highs, then the mids, then the "
+                                           "bassline. Slow and very smooth.", 32)
+                    .keys(Param::Crossfader, {{0, 0, S}, {0.125f, 0.5f, L}, {0.85f, 0.5f, S}, {1, 1, L}})
+                    .keys(Param::InHigh, {{0, 0, H}, {0.25f, 0.5f, L}, {1, 0.5f, L}})
+                    .keys(Param::OutHigh, {{0, 0.5f, H}, {0.25f, 0, L}, {1, 0, L}})
+                    .keys(Param::InMid, {{0, 0, H}, {0.5f, 0.5f, L}, {1, 0.5f, L}})
+                    .keys(Param::OutMid, {{0, 0.5f, H}, {0.5f, 0, L}, {1, 0, L}})
+                    .keys(Param::InLow, {{0, 0, H}, {0.75f, 0.5f, L}, {1, 0.5f, L}})
+                    .keys(Param::OutLow, {{0, 0.5f, H}, {0.75f, 0, L}, {1, 0, L}})
+                    .d);
+
+    {
+        // Crossfader chops: off-beat stabs of the new track, then 16th-note cuts, then it takes over.
+        std::vector<Keyframe> chops;
+        for (int i = 0; i < 8; ++i) {
+            float b = float(i) / 16.0f;  // half-beat steps through the first 4 beats
+            chops.push_back({b, i % 2 ? 1.0f : 0.0f, H});
+        }
+        for (int i = 0; i < 12; ++i) {
+            float b = 0.5f + float(i) / 32.0f;  // quarter-beat steps through beats 5-7
+            chops.push_back({b, i % 2 ? 1.0f : 0.0f, H});
+        }
+        chops.push_back({0.875f, 1, L});
+        chops.push_back({1, 1, L});
+        Builder b("Chop In", "Transformer-style crossfader cuts tease the new track in rhythm before it takes over. "
+                             "Best with tracks at similar tempos.", 8);
+        b.d.lane(Param::Crossfader).enabled = true;
+        b.d.lane(Param::Crossfader).keys = chops;
+        v.push_back(b.d);
+    }
+
+    v.push_back(Builder("Riser Drop", "Builds tension on the old track with a sweeping high-pass and growing echo, "
+                                      "then drops the new track on the downbeat.", 16)
+                    .keys(Param::OutFilter, {{0, 0.5f, S}, {0.95f, 0.93f, L}, {1, 0.93f, L}})
+                    .keys(Param::OutEcho, {{0, 0, S}, {0.5f, 0.2f, S}, {0.95f, 0.9f, L}, {1, 0.9f, L}})
+                    .keys(Param::Crossfader, {{0, 0, H}, {0.99f, 1, L}, {1, 1, L}})
+                    .inStart(1.0f)
+                    .d);
+
+    v.push_back(Builder("Low-pass Sink", "The old track sinks underwater behind a closing low-pass while the new one "
+                                         "comes up clean and takes the bass.", 16)
+                    .keys(Param::OutFilter, {{0, 0.5f, S}, {0.8f, 0.1f, L}, {1, 0.1f, L}})
+                    .keys(Param::Crossfader, {{0, 0, S}, {0.5f, 0.5f, S}, {1, 1, L}})
+                    .keys(Param::InLow, {{0, 0, H}, {0.5f, 0.5f, L}, {1, 0.5f, L}})
+                    .d);
     return v;
 }
 
@@ -191,6 +265,7 @@ void writeTransition(std::ostream& out, const TransitionDef& d) {
     out << "beats " << d.beats << "\n";
     out << "in_start " << d.inStartAt << "\n";
     out << "out_effect " << effectId(d.outEffect) << " " << d.outEffectAt << "\n";
+    if (d.inEffect == InEffect::SpinUp) out << "in_effect spinup\n";
     for (int p = 0; p < kNumParams; ++p) {
         const Lane& l = d.lanes[size_t(p)];
         if (!l.enabled) continue;
@@ -242,8 +317,15 @@ std::vector<TransitionDef> parseTransitions(std::istream& in) {
         } else if (word == "out_effect") {
             std::string e;
             ls >> e >> cur.outEffectAt;
-            cur.outEffect = e == "brake" ? OutEffect::Brake : e == "backspin" ? OutEffect::Backspin : OutEffect::None;
+            cur.outEffect = e == "brake"      ? OutEffect::Brake
+                            : e == "backspin" ? OutEffect::Backspin
+                            : e == "roll"     ? OutEffect::LoopRoll
+                                              : OutEffect::None;
             cur.outEffectAt = std::clamp(cur.outEffectAt, 0.0f, 1.0f);
+        } else if (word == "in_effect") {
+            std::string e;
+            ls >> e;
+            cur.inEffect = e == "spinup" ? InEffect::SpinUp : InEffect::None;
         } else if (word == "lane") {
             std::string id;
             ls >> id;

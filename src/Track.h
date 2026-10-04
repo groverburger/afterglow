@@ -40,8 +40,9 @@ void analyzeTrack(Track& t);
 // Estimates tempo and downbeat offset for imported audio.
 double detectBpm(const Track& t, double* firstBeatSec);
 
-// Loads wav/mp3/flac, resampled to kSampleRate stereo. Returns null on failure.
-TrackPtr loadAudioFile(const std::string& path, std::string* error);
+// Loads wav/mp3/flac (plus m4a/aac/aiff on macOS), resampled to kSampleRate stereo.
+// `detectTempo` = false skips BPM detection (when it is already known). Returns null on failure.
+TrackPtr loadAudioFile(const std::string& path, std::string* error, bool detectTempo = true);
 
 // Writes 16-bit stereo WAV. Returns false on failure.
 bool writeWav(const std::string& path, const float* interleaved, size_t frames);

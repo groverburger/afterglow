@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <fstream>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -17,9 +18,9 @@ namespace {
 const char* kActionNames[] = {"note", "load", "play", "pause", "cue", "seek", "setpos", "setplaying",
                               "hotcue_set", "hotcue_jump", "hotcue_clear", "hotcue_at", "loop", "loop_exit",
                               "loop_range", "motion", "sync", "align", "transition", "cancel_transition",
-                              "reset_fx", "master", "param"};
+                              "reset_fx", "master", "scratch", "param"};
 const char* kParamNames[] = {"volume", "trim", "eq_low", "eq_mid", "eq_high", "filter", "echo", "tempo",
-                             "tempo_range", "sync", "nudge", "cue_point", "crossfader", "xf_curve",
+                             "tempo_range", "sync", "nudge", "cue_point", "slip", "crossfader", "xf_curve",
                              "master_volume", "quantize"};
 constexpr int kNumActions = int(sizeof(kActionNames) / sizeof(kActionNames[0]));
 static_assert(kNumActions == int(SetAction::Param) + 1, "action names out of date");
@@ -57,7 +58,7 @@ TrackRef trackRefFor(const Track& t) {
 bool saveSet(const std::string& path, const SetRecording& set) {
     std::ofstream out(path);
     if (!out) return false;
-    out << "afterglow-set 1\n";
+    out << "afterglow-set " << set.version << "\n";
     out << "name " << quoteString(set.name) << "\n";
     out << "length " << set.lengthFrames << "\n\n";
     std::map<std::string, bool> written;
@@ -85,6 +86,7 @@ bool parseSet(const std::string& text, SetRecording& set, std::string* error) {
         if (error) *error = "Not an Afterglow set file";
         return false;
     }
+    set.version = std::max(1, std::atoi(line.c_str() + std::strlen("afterglow-set")));
     int lineNo = 1;
     while (std::getline(all, line)) {
         ++lineNo;

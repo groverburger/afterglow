@@ -29,11 +29,13 @@ enum class SetAction {
     CancelTransition,
     ResetFx,
     MasterDeck,        // deck
+    Scratch,           // flag = hand on the record, value = target frame
     Param,             // param = SetParam, value
 };
 
 enum class SetParam {
-    Volume, Trim, EqLow, EqMid, EqHigh, Filter, Echo, Tempo, TempoRange, Sync, Nudge, CuePoint,
+    Volume, Trim, EqLow, EqMid, EqHigh, Filter, Echo, Tempo, TempoRange, Sync, Nudge, CuePoint, Slip,
+    // Global parameters (recorded on deck 0) from here on.
     Crossfader, XfCurve, MasterVolume, Quantize,
     Count
 };
@@ -61,8 +63,11 @@ struct SetEvent {
     bool resolveFailed = false;
 };
 
+constexpr int kSetFormatVersion = 2;  // 2: transitions beat-match across bigger tempo gaps
+
 struct SetRecording {
     std::string name;
+    int version = kSetFormatVersion;
     uint64_t lengthFrames = 0;
     std::vector<SetEvent> events;
 

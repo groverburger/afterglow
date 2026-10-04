@@ -6,12 +6,14 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 
 #include "App.h"
 #include "imgui.h"
 #include "sokol_app.h"
 
 using ui::theme;
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -33,7 +35,9 @@ bool tempoCompatible(double a, double b) {
     return false;
 }
 
-ImU32 laneColor(int p) {
+}  // namespace
+
+ImU32 transitionLaneColor(int p) {
     static const ImU32 c[kNumParams] = {
         IM_COL32(255, 255, 255, 255),                                // crossfader
         IM_COL32(255, 120, 120, 255), IM_COL32(120, 255, 160, 255),  // volumes
@@ -42,9 +46,57 @@ ImU32 laneColor(int p) {
         IM_COL32(230, 230, 255, 255), IM_COL32(200, 255, 255, 255),  // highs
         IM_COL32(190, 120, 255, 255), IM_COL32(230, 150, 255, 255),  // filters
         IM_COL32(255, 90, 170, 255),  IM_COL32(255, 140, 200, 255),  // echoes
+        IM_COL32(255, 200, 60, 255),                                 // tempo glide
     };
+    static_assert(sizeof(c) / sizeof(c[0]) == kNumParams, "lane colours out of date");
     return c[p];
 }
+
+void drawTransitionThumb(ImDrawList* dl, const TransitionDef& def, ImVec2 p0, ImVec2 p1, float alpha) {
+    dl->AddRectFilled(p0, p1, ui::withAlpha(IM_COL32(8, 8, 14, 255), alpha), 3.0f);
+    const float w = p1.x - p0.x, h = p1.y - p0.y, pad = 3.0f;
+    // Bar lines.
+    if (def.beats <= 64)
+        for (int b = 4; b < def.beats; b += 4) {
+            float x = p0.x + w * float(b) / float(def.beats);
+            dl->AddLine(ImVec2(x, p0.y + 1), ImVec2(x, p1.y - 1), ui::withAlpha(IM_COL32(255, 255, 255, 22), alpha));
+        }
+    auto pt = [&](float t, float v) { return ImVec2(p0.x + t * w, p1.y - pad - v * (h - 2 * pad)); };
+    // In-deck start and out effect markers.
+    if (def.inStartAt > 0.0f) {
+        float x = p0.x + def.inStartAt * w;
+        dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), ui::withAlpha(IM_COL32(80, 255, 140, 120), alpha), 1.0f);
+    }
+    if (def.outEffect != OutEffect::None) {
+        float x = p0.x + def.outEffectAt * w;
+        dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), ui::withAlpha(IM_COL32(255, 90, 90, 140), alpha), 1.0f);
+    }
+    const int steps = 48;
+    ImVec2 pts[steps + 1];
+    for (int pass = 0; pass < 2; ++pass) {
+        // Other lanes first, the crossfader on top.
+        for (int p = 0; p < kNumParams; ++p) {
+            const Lane& l = def.lanes[size_t(p)];
+            const bool xf = p == int(Param::Crossfader);
+            if (!l.enabled || l.keys.empty() || xf != (pass == 1)) continue;
+            for (int i = 0; i <= steps; ++i) {
+                float t = float(i) / steps;
+                pts[i] = pt(t, l.eval(t));
+            }
+            dl->AddPolyline(pts, steps + 1, ui::withAlpha(transitionLaneColor(p), alpha * (xf ? 1.0f : 0.7f)), 0, xf ? 2.0f : 1.3f);
+        }
+    }
+}
+
+const char* lengthScaleLabel(float scale) {
+    if (scale <= 0.25f) return "x1/4";
+    if (scale <= 0.5f) return "x1/2";
+    if (scale <= 1.0f) return "x1";
+    if (scale <= 2.0f) return "x2";
+    return "x4";
+}
+
+namespace {
 
 void valueLabels(Param p, const char** lo, const char** mid, const char** hi) {
     switch (p) {
@@ -55,6 +107,7 @@ void valueLabels(Param p, const char** lo, const char** mid, const char** hi) {
         case Param::InEcho:
         case Param::OutVolume:
         case Param::InVolume: *lo = "0%"; *mid = "50%"; *hi = "100%"; break;
+        case Param::Tempo: *lo = "Out track's BPM"; *mid = "halfway"; *hi = "In track's BPM"; break;
         default: *lo = "kill"; *mid = "normal"; *hi = "boost"; break;
     }
 }
@@ -133,120 +186,278 @@ void App::drawBottomTabs(ImVec2 pos, ImVec2 size) {
 
 // ---------------------------------------------------------------- library ----
 
+namespace {
+
+void insertFolderPath(FolderNode& root, const std::string& rel) {
+    ++root.count;
+    FolderNode* node = &root;
+    size_t pos = 0;
+    while (pos < rel.size()) {
+        size_t slash = rel.find('/', pos);
+        if (slash == std::string::npos) slash = rel.size();
+        std::string name = rel.substr(pos, slash - pos);
+        std::string path = rel.substr(0, slash);
+        auto it = std::find_if(node->kids.begin(), node->kids.end(), [&](const FolderNode& k) { return k.name == name; });
+        if (it == node->kids.end()) {
+            node->kids.push_back(FolderNode{name, path, 0, {}});
+            it = node->kids.end() - 1;
+        }
+        node = &*it;
+        ++node->count;
+        pos = slash + 1;
+    }
+}
+
+void sortFolderTree(FolderNode& n) {
+    std::sort(n.kids.begin(), n.kids.end(), [](const FolderNode& a, const FolderNode& b) { return a.name < b.name; });
+    for (auto& k : n.kids) sortFolderTree(k);
+}
+
+}  // namespace
+
+void App::drawLibrarySources() {
+    const int n = library.size();
+    if (folderTreeGen != library.generation()) {
+        folderTreeGen = library.generation();
+        folderTrees.clear();
+        for (const auto& root : musicFolders) folderTrees.push_back(FolderNode{fs::path(root).filename().string(), "", 0, {}});
+        for (int i = 0; i < n; ++i) {
+            LibraryEntry* e = library.entry(i);
+            if (e->hidden || e->root.empty()) continue;
+            for (size_t r = 0; r < musicFolders.size(); ++r)
+                if (musicFolders[r] == e->root) insertFolderPath(folderTrees[r], e->relDir);
+        }
+        for (auto& t : folderTrees) sortFolderTree(t);
+    }
+    int counts[4] = {0, 0, 0, 0};  // all, built-in, clips, dropped
+    for (int i = 0; i < n; ++i) {
+        LibraryEntry* e = library.entry(i);
+        if (e->hidden) continue;
+        ++counts[0];
+        if (e->kind == EntryKind::Stock) ++counts[1];
+        else if (e->kind == EntryKind::Clip) ++counts[2];
+        else if (e->root.empty()) ++counts[3];
+    }
+
+    auto source = [&](const char* label, LibrarySource::Kind k, int count) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%s  (%d)", label, count);
+        if (ImGui::Selectable(buf, libSource.kind == k)) libSource = {k, "", ""};
+    };
+    source("All tracks", LibrarySource::All, counts[0]);
+    source("Built-in songs", LibrarySource::BuiltIn, counts[1]);
+    if (counts[2]) source("My clips", LibrarySource::Clips, counts[2]);
+    if (counts[3]) source("Dropped files", LibrarySource::Dropped, counts[3]);
+
+    ImGui::SeparatorText("Music folders");
+    std::string removeRoot;
+    std::function<void(const FolderNode&, const std::string&, bool)> drawNode = [&](const FolderNode& node, const std::string& root,
+                                                                                     bool isRoot) {
+        const bool selected = libSource.kind == LibrarySource::Folder && libSource.root == root && libSource.rel == node.rel;
+        ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick | ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (node.kids.empty()) f |= ImGuiTreeNodeFlags_Leaf;
+        if (selected) f |= ImGuiTreeNodeFlags_Selected;
+        if (isRoot) f |= ImGuiTreeNodeFlags_DefaultOpen;
+        bool open = ImGui::TreeNodeEx((root + "|" + node.rel).c_str(), f, "%s  (%d)", node.name.c_str(), node.count);
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) libSource = {LibrarySource::Folder, root, node.rel};
+        if (isRoot) {
+            ui::Tip((root + "\nRight-click for options").c_str());
+            if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::MenuItem("Rescan for new files")) library.rescan();
+                if (ImGui::MenuItem("Show in Finder / Explorer")) revealFolder(root);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Remove from Library")) removeRoot = root;
+                ImGui::EndPopup();
+            }
+        }
+        if (open) {
+            for (const auto& k : node.kids) drawNode(k, root, false);
+            ImGui::TreePop();
+        }
+    };
+    for (size_t r = 0; r < folderTrees.size() && r < musicFolders.size(); ++r) drawNode(folderTrees[r], musicFolders[r], true);
+    if (!removeRoot.empty()) removeMusicFolder(removeRoot);
+    if (musicFolders.empty()) ImGui::TextWrapped("Add a folder (like your Music folder) to see its tracks here.");
+
+    ImGui::Spacing();
+    if (ImGui::Button("+ Add folder...", ImVec2(-44, 0))) wantFolderPicker = true;
+    ui::Tip("Pick a folder: every track in it and its sub-folders shows up in the Library. You can also drag a folder onto the window.");
+    ImGui::SameLine(0, 4);
+    if (ImGui::Button("Path", ImVec2(-1, 0))) ImGui::OpenPopup("##addpath");
+    ui::Tip("Type or paste a folder path instead");
+    if (ImGui::BeginPopup("##addpath")) {
+        ImGui::SetNextItemWidth(360);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+#if defined(_WIN32)
+        const char* hint = "D:\\Music or C:\\path\\to\\folder";
+#else
+        const char* hint = "~/Music or /path/to/folder";
+#endif
+        bool go = ImGui::InputTextWithHint("##fp", hint, folderPathInput, sizeof(folderPathInput),
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        go |= ImGui::Button("Add");
+        if (go && folderPathInput[0] && addMusicFolder(folderPathInput)) {
+            folderPathInput[0] = 0;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (library.scanning()) {
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Scanning... %d files", library.scanFound());
+    } else if (int pending = library.analysisPending(); pending > 0) {
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Reading tempos: %d left", pending);
+        ui::Tip("New tracks are analysed once in the background (BPM and length) and remembered for next time.");
+    }
+}
+
 void App::drawLibrary() {
-    ImGui::SetNextItemWidth(260);
-    ImGui::InputTextWithHint("##search", "Search title, artist, genre...", search, sizeof(search));
+    ImGui::BeginChild("##libsrc", ImVec2(230, 0), ImGuiChildFlags_Borders);
+    drawLibrarySources();
+    ImGui::EndChild();
     ImGui::SameLine();
-    ImGui::TextDisabled("Double-click a track to load it on the free deck. Drop WAV/MP3/FLAC files on the window to import.");
+    ImGui::BeginGroup();
+
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputTextWithHint("##search", "Search title, artist, folder...", search, sizeof(search));
+    ImGui::SameLine();
+    ImGui::TextDisabled("Double-click a track to load it on the free deck. Drop files or folders on the window to add them.");
 
     const int n = library.size();
     const int live = liveDeck();
     const Track* liveTrack = live >= 0 ? engine.decks[live].track.get() : nullptr;
 
-    std::vector<int> rows;
+    std::vector<std::pair<int, LibraryEntry*>> rows;
     std::string q = search;
     for (auto& c : q) c = char(std::tolower((unsigned char)c));
     for (int i = 0; i < n; ++i) {
         LibraryEntry* e = library.entry(i);
-        if (!q.empty()) {
-            std::string hay = e->name + " " + e->artist + " " + e->genre;
-            for (auto& c : hay) c = char(std::tolower((unsigned char)c));
-            if (hay.find(q) == std::string::npos) continue;
-        }
-        rows.push_back(i);
+        if (!entryInSource(*e, libSource)) continue;
+        if (!q.empty() && e->searchText.find(q) == std::string::npos) continue;
+        rows.push_back({i, e});
+    }
+    if (rows.empty()) {
+        ImGui::Spacing();
+        if (libSource.kind == LibrarySource::Folder && library.scanning()) ImGui::TextDisabled("Scanning this folder...");
+        else if (!q.empty()) ImGui::TextDisabled("No tracks match \"%s\".", search);
+        else if (libSource.kind == LibrarySource::Folder)
+            ImGui::TextDisabled("No playable audio files in this folder (supported: %s).", supportedFormats());
+        else ImGui::TextDisabled("Nothing here yet.");
+        ImGui::EndGroup();
+        return;
     }
 
     ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV |
                          ImGuiTableFlags_Sortable | ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
-    if (!ImGui::BeginTable("##lib", 8, tf)) return;
+    if (!ImGui::BeginTable("##lib", 8, tf)) {
+        ImGui::EndGroup();
+        return;
+    }
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("Load", ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthFixed, 64);
     ImGui::TableSetupColumn("Title", ImGuiTableColumnFlags_DefaultSort, 3.0f);
     ImGui::TableSetupColumn("Artist", 0, 2.0f);
-    ImGui::TableSetupColumn("Genre", 0, 1.6f);
+    ImGui::TableSetupColumn("Genre / Folder", 0, 1.6f);
     ImGui::TableSetupColumn("BPM", ImGuiTableColumnFlags_WidthFixed, 56);
     ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 56);
     ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthFixed, 70);
     ImGui::TableSetupColumn("Match", ImGuiTableColumnFlags_WidthFixed, 90);
     ImGui::TableHeadersRow();
 
+    auto genreOf = [](const LibraryEntry* e) -> std::string {
+        if (!e->genre.empty()) return e->genre;
+        return e->relDir.empty() ? "" : fs::path(e->relDir).filename().string();
+    };
     if (ImGuiTableSortSpecs* ss = ImGui::TableGetSortSpecs(); ss && ss->SpecsCount > 0) {
         const ImGuiTableColumnSortSpecs& s = ss->Specs[0];
-        std::stable_sort(rows.begin(), rows.end(), [&](int a, int b) {
-            LibraryEntry *x = library.entry(a), *y = library.entry(b);
+        std::stable_sort(rows.begin(), rows.end(), [&](const auto& ra, const auto& rb) {
+            const LibraryEntry *x = ra.second, *y = rb.second;
             int c = 0;
             switch (s.ColumnIndex) {
                 case 1: c = x->name.compare(y->name); break;
                 case 2: c = x->artist.compare(y->artist); break;
-                case 3: c = x->genre.compare(y->genre); break;
+                case 3: c = genreOf(x).compare(genreOf(y)); break;
                 case 4: c = x->bpm < y->bpm ? -1 : x->bpm > y->bpm ? 1 : 0; break;
                 case 5: c = x->key.compare(y->key); break;
                 case 6: c = x->lengthSec < y->lengthSec ? -1 : x->lengthSec > y->lengthSec ? 1 : 0; break;
-                default: c = a - b; break;
+                default: c = ra.first - rb.first; break;
             }
-            // Title sort keeps the original library order (the stock set list).
-            if (s.ColumnIndex == 1 && s.SortDirection == ImGuiSortDirection_Ascending) c = a - b;
+            // Title sort keeps the original library order (the stock set list, then folders A-Z).
+            if (s.ColumnIndex == 1 && s.SortDirection == ImGuiSortDirection_Ascending) c = ra.first - rb.first;
             return s.SortDirection == ImGuiSortDirection_Ascending ? c < 0 : c > 0;
         });
     }
 
-    for (int i : rows) {
-        LibraryEntry* e = library.entry(i);
-        ImGui::PushID(i);
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        for (int d = 0; d < 2; ++d) {
-            if (d) ImGui::SameLine(0, 4);
-            char lbl[8];
-            std::snprintf(lbl, sizeof(lbl), "%c", 'A' + d);
-            if (ui::ColoredButton(lbl, theme.deck[d], ImVec2(26, 0), deckEntry[d] == i)) requestLoad(d, i);
-            ui::Tip(d == 0 ? "Load on deck A" : "Load on deck B");
+    ImGuiListClipper clipper;
+    clipper.Begin(int(rows.size()));
+    while (clipper.Step()) {
+        for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
+            const int i = rows[size_t(r)].first;
+            LibraryEntry* e = rows[size_t(r)].second;
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            for (int d = 0; d < 2; ++d) {
+                if (d) ImGui::SameLine(0, 4);
+                char lbl[8];
+                std::snprintf(lbl, sizeof(lbl), "%c", 'A' + d);
+                if (ui::ColoredButton(lbl, theme.deck[d], ImVec2(26, 0), deckEntry[d] == i)) requestLoad(d, i);
+                ui::Tip(d == 0 ? "Load on deck A" : "Load on deck B");
+            }
+            ImGui::TableSetColumnIndex(1);
+            bool onDeck = deckEntry[0] == i || deckEntry[1] == i;
+            if (onDeck) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(theme.deck[deckEntry[0] == i ? 0 : 1]));
+            if (ImGui::Selectable(e->name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick |
+                                                              ImGuiSelectableFlags_AllowOverlap)) {
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) requestLoad(smartTargetDeck(), i);
+            }
+            if (onDeck) ImGui::PopStyleColor();
+            if (!e->path.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) ImGui::SetTooltip("%s", e->path.c_str());
+            if (ImGui::BeginDragDropSource()) {
+                ImGui::SetDragDropPayload("LIB_ENTRY", &i, sizeof(int));
+                ImGui::Text("Drop on a deck to load \"%s\"", e->name.c_str());
+                ImGui::EndDragDropSource();
+            }
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(e->artist.c_str());
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextDisabled("%s", genreOf(e).c_str());
+            ImGui::TableSetColumnIndex(4);
+            if (e->bpm > 0) ImGui::Text("%.1f", e->bpm);
+            else ImGui::TextDisabled("...");
+            ImGui::TableSetColumnIndex(5);
+            ImGui::TextUnformatted(e->key.c_str());
+            ImGui::TableSetColumnIndex(6);
+            EntryState st = e->state;
+            if (st == EntryState::Loading) {
+                if (e->kind == EntryKind::Stock) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%d%%", int(e->progress * 100));
+                else ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), e->wanted ? "loading" : "reading");
+            } else if (st == EntryState::Queued && e->lengthSec <= 0) {
+                ImGui::TextDisabled("queued");
+            } else if (st == EntryState::Failed) {
+                ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "error");
+                ui::Tip(e->error.c_str());
+            } else if (e->lengthSec > 0) {
+                ImGui::TextUnformatted(formatTime(e->lengthSec).c_str());
+            } else {
+                ImGui::TextDisabled("-");
+            }
+            ImGui::TableSetColumnIndex(7);
+            if (liveTrack && !onDeck) {
+                bool t = tempoCompatible(e->bpm, liveTrack->bpm), k = keysCompatible(e->key, liveTrack->key);
+                if (t && k) ImGui::TextColored(ImVec4(0.4f, 1, 0.5f, 1), "great");
+                else if (t) ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.5f, 1), "tempo ok");
+                else if (k) ImGui::TextColored(ImVec4(0.7f, 0.8f, 1, 1), "key ok");
+                else ImGui::TextDisabled("-");
+                ui::Tip("How well this track fits what's playing now: similar tempo and a harmonically compatible key (Camelot wheel) mix best.");
+            } else if (onDeck) {
+                ImGui::TextDisabled("on deck %c", deckEntry[0] == i ? 'A' : 'B');
+            }
+            ImGui::PopID();
         }
-        ImGui::TableSetColumnIndex(1);
-        bool onDeck = deckEntry[0] == i || deckEntry[1] == i;
-        if (onDeck) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(theme.deck[deckEntry[0] == i ? 0 : 1]));
-        if (ImGui::Selectable(e->name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick |
-                                                          ImGuiSelectableFlags_AllowOverlap)) {
-            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) requestLoad(smartTargetDeck(), i);
-        }
-        if (onDeck) ImGui::PopStyleColor();
-        if (ImGui::BeginDragDropSource()) {
-            ImGui::SetDragDropPayload("LIB_ENTRY", &i, sizeof(int));
-            ImGui::Text("Drop on a deck to load \"%s\"", e->name.c_str());
-            ImGui::EndDragDropSource();
-        }
-        ImGui::TableSetColumnIndex(2);
-        ImGui::TextUnformatted(e->artist.c_str());
-        ImGui::TableSetColumnIndex(3);
-        ImGui::TextDisabled("%s", e->genre.c_str());
-        ImGui::TableSetColumnIndex(4);
-        if (e->bpm > 0) ImGui::Text("%.1f", e->bpm);
-        else ImGui::TextDisabled("...");
-        ImGui::TableSetColumnIndex(5);
-        ImGui::TextUnformatted(e->key.c_str());
-        ImGui::TableSetColumnIndex(6);
-        EntryState st = e->state;
-        if (st == EntryState::Loading) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%d%%", int(e->progress * 100));
-        else if (st == EntryState::Queued) ImGui::TextDisabled("queued");
-        else if (st == EntryState::Failed) {
-            ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1), "error");
-            ui::Tip(e->error.c_str());
-        } else if (e->lengthSec > 0) ImGui::TextUnformatted(formatTime(e->lengthSec).c_str());
-        else ImGui::TextDisabled("-");
-        ImGui::TableSetColumnIndex(7);
-        if (liveTrack && !onDeck) {
-            bool t = tempoCompatible(e->bpm, liveTrack->bpm), k = keysCompatible(e->key, liveTrack->key);
-            if (t && k) ImGui::TextColored(ImVec4(0.4f, 1, 0.5f, 1), "great");
-            else if (t) ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.5f, 1), "tempo ok");
-            else if (k) ImGui::TextColored(ImVec4(0.7f, 0.8f, 1, 1), "key ok");
-            else ImGui::TextDisabled("-");
-            ui::Tip("How well this track fits what's playing now: similar tempo and a harmonically compatible key (Camelot wheel) mix best.");
-        } else if (onDeck) {
-            ImGui::TextDisabled("on deck %c", deckEntry[0] == i ? 'A' : 'B');
-        }
-        ImGui::PopID();
     }
     ImGui::EndTable();
+    ImGui::EndGroup();
 }
 
 // ------------------------------------------------------------ clip editor ----
@@ -264,7 +475,11 @@ void App::drawClipEditor() {
     if (ImGui::BeginCombo("##clipsrc", e ? e->name.c_str() : "-")) {
         for (int i = 0; i < n; ++i) {
             LibraryEntry* x = library.entry(i);
-            if (ImGui::Selectable(x->name.c_str(), i == c.entry)) {
+            if (x->hidden) continue;
+            ImGui::PushID(i);
+            bool picked = ImGui::Selectable(x->name.c_str(), i == c.entry);
+            ImGui::PopID();
+            if (picked) {
                 c.entry = i;
                 c.viewStart = c.viewEnd = 0;
                 c.selA = c.selB = -1;
@@ -586,13 +801,14 @@ void App::drawTransitionEditor() {
         def.inStartAt = std::round(inBeat) / float(def.beats);
         s.dirty = true;
     }
-    const char* fx[] = {"No stop effect", "Power down", "Backspin"};
+    const char* fx[] = {"No stop effect", "Power down", "Backspin", "Loop roll"};
     int fxi = int(def.outEffect);
     ImGui::SetNextItemWidth(150);
-    if (ImGui::Combo("Out deck effect", &fxi, fx, 3)) {
+    if (ImGui::Combo("Out deck effect", &fxi, fx, 4)) {
         def.outEffect = OutEffect(fxi);
         s.dirty = true;
     }
+    ui::Tip("Power down / Backspin stop the old record. Loop roll stutters it in shrinking loops (1, 1/2, 1/4, 1/8 beat) until the end.");
     if (def.outEffect != OutEffect::None) {
         ImGui::SameLine();
         float fxBeat = def.outEffectAt * def.beats;
@@ -602,6 +818,15 @@ void App::drawTransitionEditor() {
             s.dirty = true;
         }
     }
+    ImGui::SameLine(0, 20);
+    const char* inFx[] = {"Normal start", "Spin up"};
+    int ifx = int(def.inEffect);
+    ImGui::SetNextItemWidth(130);
+    if (ImGui::Combo("In deck start", &ifx, inFx, 2)) {
+        def.inEffect = InEffect(ifx);
+        s.dirty = true;
+    }
+    ui::Tip("Spin up: the new record starts from a standstill and speeds up like a turntable switched on.");
     ImGui::EndDisabled();
 
     // Lane list.
@@ -623,7 +848,7 @@ void App::drawTransitionEditor() {
         ImGui::EndDisabled();
         ui::Tip("Enable to let this transition control it");
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::withAlpha(laneColor(p), l.enabled ? 1.0f : 0.45f)));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::withAlpha(transitionLaneColor(p), l.enabled ? 1.0f : 0.45f)));
         if (ImGui::Selectable(paramName(Param(p)), s.lane == p)) s.lane = p;
         ImGui::PopStyleColor();
         ImGui::PopID();
@@ -645,7 +870,7 @@ void App::drawTransitionEditor() {
         }
         ui::Tip(tip);
     };
-    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(laneColor(s.lane)), "%s", paramName(lp));
+    ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(transitionLaneColor(s.lane)), "%s", paramName(lp));
     float nv = paramNeutral(lp);
     preset("Ramp up", {{0, 0, CurveShape::Smooth}, {1, 1, CurveShape::Smooth}}, "Smoothly from 0 to full");
     preset("Ramp down", {{0, 1, CurveShape::Smooth}, {1, 0, CurveShape::Smooth}}, "Smoothly from full to 0");
@@ -699,12 +924,14 @@ void App::drawTransitionEditor() {
     {
         float x = c0.x + def.inStartAt * cw;
         dl->AddLine(ImVec2(x, c0.y), ImVec2(x, c1.y), IM_COL32(80, 255, 140, 160), 2.0f);
-        dl->AddText(ImVec2(x + 4, c0.y + 2), IM_COL32(80, 255, 140, 220), "In starts");
+        dl->AddText(ImVec2(x + 4, c0.y + 2), IM_COL32(80, 255, 140, 220), def.inEffect == InEffect::SpinUp ? "In spins up" : "In starts");
         if (def.outEffect != OutEffect::None) {
             float fx2 = c0.x + def.outEffectAt * cw;
             dl->AddLine(ImVec2(fx2, c0.y), ImVec2(fx2, c1.y), IM_COL32(255, 90, 90, 160), 2.0f);
-            dl->AddText(ImVec2(fx2 + 4, c0.y + 16), IM_COL32(255, 90, 90, 220),
-                        def.outEffect == OutEffect::Brake ? "Power down" : "Backspin");
+            const char* fxName = def.outEffect == OutEffect::Brake      ? "Power down"
+                                 : def.outEffect == OutEffect::Backspin ? "Backspin"
+                                                                         : "Loop roll";
+            dl->AddText(ImVec2(fx2 + 4, c0.y + 16), IM_COL32(255, 90, 90, 220), fxName);
         }
     }
     auto drawLane = [&](const Lane& l, ImU32 col, float thick) {
@@ -718,16 +945,16 @@ void App::drawTransitionEditor() {
     };
     for (int p = 0; p < kNumParams; ++p)
         if (p != s.lane && def.lanes[size_t(p)].enabled && !def.lanes[size_t(p)].keys.empty())
-            drawLane(def.lanes[size_t(p)], ui::withAlpha(laneColor(p), 0.25f), 1.5f);
+            drawLane(def.lanes[size_t(p)], ui::withAlpha(transitionLaneColor(p), 0.25f), 1.5f);
     if (lane.enabled && !lane.keys.empty()) {
-        drawLane(lane, laneColor(s.lane), 3.0f);
+        drawLane(lane, transitionLaneColor(s.lane), 3.0f);
         int hoverKey = -1;
         for (int k = 0; k < int(lane.keys.size()); ++k) {
             ImVec2 kp = toScreen(lane.keys[size_t(k)].t, lane.keys[size_t(k)].v);
             float d2 = (kp.x - io.MousePos.x) * (kp.x - io.MousePos.x) + (kp.y - io.MousePos.y) * (kp.y - io.MousePos.y);
             if (hovered && d2 < 64) hoverKey = k;
             bool hot = k == hoverKey || k == s.dragKey;
-            dl->AddCircleFilled(kp, hot ? 7.0f : 5.0f, hot ? IM_COL32(255, 255, 255, 255) : laneColor(s.lane));
+            dl->AddCircleFilled(kp, hot ? 7.0f : 5.0f, hot ? IM_COL32(255, 255, 255, 255) : transitionLaneColor(s.lane));
             dl->AddCircle(kp, hot ? 7.0f : 5.0f, IM_COL32(0, 0, 0, 255));
         }
         if (!ro) {
@@ -845,7 +1072,7 @@ void App::drawAutoDj() {
             ImGui::SameLine();
             ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(theme.deck[other]), "%s", engine.decks[other].track->name.c_str());
             if (autoDj && !engine.transitionBusy()) {
-                const TransitionDef& def = transitions[size_t(selectedTransition)];
+                const TransitionDef def = activeTransition();
                 double spb = l.secPerBeat() / std::max(0.25, l.rate());
                 double in = l.remainingSec() - (def.beats + 6) * spb;
                 ImGui::SameLine();
@@ -919,7 +1146,9 @@ void App::drawHelpWindow() {
         ImGui::BulletText("LOOP buttons repeat a few beats on the beat. HOT CUES remember spots to jump back to.");
         ImGui::BulletText("Clip Editor: cut your favourite part of any track into a new clip (saved as WAV).");
         ImGui::BulletText("Transition Editor: duplicate a stock transition and draw your own automation curves.");
-        ImGui::BulletText("Drag your own WAV / MP3 / FLAC files onto the window, or put them in the music folder (File menu).");
+        ImGui::BulletText("Your music: the Library shows your Music folder. Add more folders with \"+ Add folder\" (or drag one onto the window).");
+        ImGui::BulletText("Grab a waveform and drag it to scratch or move the record. Turn on SLIP to scratch without losing the beat.");
+        ImGui::BulletText("Tracks at very different tempos? Use Tempo Ramp, Echo Out, Backspin or Power Swap.");
         ImGui::SeparatorText("Keyboard");
         ImGui::TextUnformatted("Q / P  play-pause deck A / B      T  run transition      F  party mode\n"
                                "V  next visual      H  this help      Esc  leave party mode");

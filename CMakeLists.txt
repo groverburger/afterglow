@@ -12,6 +12,10 @@ endif()
 include(CTest)
 find_package(Threads REQUIRED)
 
+if(MINGW)
+  # Self-contained exes: no libstdc++/libgcc/winpthread DLLs to ship.
+  string(APPEND CMAKE_EXE_LINKER_FLAGS " -static")
+endif()
 if(MSVC)
   set(AFTERGLOW_WARNINGS /W4)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX)
@@ -54,6 +58,13 @@ add_library(afterglow_core STATIC src/Engine.cpp src/SetFile.cpp src/Transitions
 target_include_directories(afterglow_core PUBLIC src)
 target_link_libraries(afterglow_core PUBLIC dr_libs Threads::Threads)
 target_compile_options(afterglow_core PRIVATE ${AFTERGLOW_WARNINGS})
+if(APPLE)
+  # Core Audio decodes the formats dr_libs can't (AAC/ALAC .m4a, AIFF).
+  target_link_libraries(afterglow_core PUBLIC "-framework AudioToolbox" "-framework CoreFoundation")
+elseif(WIN32)
+  # Media Foundation decodes M4A/AAC/ALAC and WMA (its DLLs are loaded at runtime).
+  target_link_libraries(afterglow_core PUBLIC mfuuid ole32)
+endif()
 
 # Embed the UI font so the app looks the same everywhere and never depends on the launch directory.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/assets/Roboto-Regular.ttf" FONT_HEX HEX)
@@ -74,6 +85,21 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 # ---- the app -----------------------------------------------------------------
 set(APP_SOURCES src/main.cpp src/UIDecks.cpp src/UIPanels.cpp src/UISets.cpp src/Visuals.cpp src/Widgets.cpp)
 if(APPLE)
+  list(APPEND APP_SOURCES src/platform/folder_picker.mm)
+  set_source_files_properties(src/platform/folder_picker.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+else()
+  list(APPEND APP_SOURCES src/platform/folder_picker.cpp)
+endif()
+if(WIN32)
+  # Icon + manifest (UTF-8 code page so narrow-string file APIs accept any path, long paths).
+  list(APPEND APP_SOURCES src/platform/win32_shell.cpp cmake/Afterglow.rc)
+  if(MSVC)
+    list(APPEND APP_SOURCES cmake/Afterglow.manifest)  # merged by the linker
+  else()
+    set_source_files_properties(cmake/Afterglow.rc PROPERTIES COMPILE_DEFINITIONS AFTERGLOW_RC_MANIFEST)
+  endif()
+endif()
+if(APPLE)
   set(APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/Afterglow.icns")
   set_source_files_properties(${APP_ICON} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
   list(APPEND APP_SOURCES ${APP_ICON})
@@ -82,6 +108,9 @@ add_executable(afterglow WIN32 MACOSX_BUNDLE ${APP_SOURCES})
 target_include_directories(afterglow PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(afterglow PRIVATE afterglow_core sokol imgui)
 target_compile_options(afterglow PRIVATE ${AFTERGLOW_WARNINGS})
+if(WIN32)
+  target_link_libraries(afterglow PRIVATE ole32 shell32 uuid)
+endif()
 set_target_properties(afterglow PROPERTIES
   OUTPUT_NAME Afterglow
   MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"

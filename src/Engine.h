@@ -13,7 +13,7 @@
 
 constexpr int kNumHotCues = 4;
 
-enum class Motion { Normal, Brake, Backspin };
+enum class Motion { Normal, Brake, Backspin, SpinUp };
 
 struct Deck {
     int index = 0;
@@ -46,6 +46,16 @@ struct Deck {
     double motionTime = 0;
     double motionStartRate = 1;
 
+    // Hand on the record: while `scratching`, the playhead chases `scratchTarget`
+    // (forwards or backwards) instead of playing at `rate()`, paused or not.
+    bool scratching = false;
+    double scratchTarget = 0;
+    double scratchRate = 0;
+    // Slip mode: the track keeps running silently underneath a scratch (or loop)
+    // and playback continues from there on release, so a mix stays in time.
+    bool slip = false;
+    double slipPos = 0;
+
     // DSP state.
     dsp::ThreeBandEq eqDsp;
     dsp::DjFilter filterDsp;
@@ -76,11 +86,14 @@ struct TransitionRun {
     double elapsed = 0;       // frames since start
     double length = 0;        // frames
     double outBeatAtStart = 0;
+    double outBpmAtStart = 0; // tempo glide: where the Tempo lane's 0 is
+    double inTargetBpm = 0;   // tempo glide: where the Tempo lane's 1 is
     double framesPerBeat = 0; // of the transition clock
     bool inStarted = false;
     bool fxFired = false;
     bool synced = false;
     bool land = false;        // in deck's position is where the blend should END
+    float rollBeats = 0;      // current loop-roll length (LoopRoll out effect)
     float progress = 0;
 };
 
@@ -124,6 +137,10 @@ public:
     void exitLoop(int d);
     void setLoopRange(int d, double inFrame, double outFrame);
     void startMotion(int d, Motion m);
+    // Grabs (held) / moves / releases the record. `target` is the frame under the hand.
+    void scratch(int d, bool held, double target);
+    // Tempo ratio (and half/double-time fold) that would match deck d to the other deck.
+    bool computeSync(int d, double* ratio, double* fold) const;
     // Matches tempo to the other deck. Returns false (and sets `why`) if impossible.
     bool syncTempo(int d, std::string* why);
     // Shifts deck d onto the master's beat. barAlign also matches the position in the bar
@@ -152,6 +169,11 @@ public:
     void copyScope(float* dst, int frames);
 
     uint64_t clock = 0;  // frames rendered
+
+    // Replays of sets recorded before 0.3 use the old transition sync rule so they sound as recorded.
+    bool legacyTransitionSync = false;
+    // Whether a transition will tempo-match the (not yet playing) incoming deck; fills the rate it will run at.
+    bool planTransitionSync(const TransitionDef& def, int inDeck, double* ratio, double* fold) const;
 
     // Raw playhead jump (no quantize), e.g. for jogging a paused deck.
     void setPosition(int d, double frames);
@@ -219,9 +241,9 @@ private:
     void renderDeck(Deck& dk, float* mix, int frames, float xfTarget);
     void updateTransition(int frames);
     void beginTransitionNow();
+    void updateRoll(float t);
     void startIncoming();
     void finishTransition();
     void applyLanes(float t);
     void followSync();
-    bool computeSync(int d, double* ratio, double* fold) const;
 };

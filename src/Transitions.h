@@ -10,6 +10,7 @@
 //   Crossfader: 0 = fully Out, 1 = fully In
 //   Volume / Echo: 0..1
 //   Filter / EQ: 0.5 = neutral (filter: 0 low-pass, 1 high-pass; EQ: 0 = kill)
+//   Tempo: 0 = the Out track's tempo, 1 = the In track's own tempo (both decks glide together)
 enum class Param {
     Crossfader,
     OutVolume, InVolume,
@@ -18,6 +19,7 @@ enum class Param {
     OutHigh, InHigh,
     OutFilter, InFilter,
     OutEcho, InEcho,
+    Tempo,
     Count
 };
 constexpr int kNumParams = int(Param::Count);
@@ -41,7 +43,8 @@ struct Lane {
     void sortKeys();
 };
 
-enum class OutEffect { None, Brake, Backspin };
+enum class OutEffect { None, Brake, Backspin, LoopRoll };
+enum class InEffect { None, SpinUp };
 
 struct TransitionDef {
     std::string name;
@@ -51,10 +54,14 @@ struct TransitionDef {
     float inStartAt = 0.0f;    // when (0..1) the incoming deck starts playing
     OutEffect outEffect = OutEffect::None;
     float outEffectAt = 0.0f;  // when (0..1) the out effect fires
+    InEffect inEffect = InEffect::None;  // how the incoming deck starts (at inStartAt)
     std::array<Lane, kNumParams> lanes;
 
     Lane& lane(Param p) { return lanes[size_t(p)]; }
     const Lane& lane(Param p) const { return lanes[size_t(p)]; }
+    // True when both tracks are heard together for a while, so they need matching tempos.
+    // Cuts, backspins and echo-outs work across any tempo gap.
+    bool overlaps() const { return lane(Param::Tempo).enabled || (inStartAt < 0.5f && beats > 2); }
 };
 
 std::vector<TransitionDef> makeStockTransitions();

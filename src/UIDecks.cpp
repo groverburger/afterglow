@@ -100,7 +100,10 @@ void App::drawWaveforms(ImVec2 pos, ImVec2 size) {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     const float gutter = 110.0f;
     const float laneH = (avail.y - 4.0f) * 0.5f;
-    static bool jogging[2] = {false, false};
+    // Drag state per lane: 0 none, 1 scratch (hand on the record), 2 nudge / silent scrub (Shift).
+    static int dragMode[2] = {0, 0};
+    static float grabX[2] = {0, 0};
+    static double grabPos[2] = {0, 0};
 
     for (int d = 0; d < 2; ++d) {
         Deck& dk = engine.decks[d];
@@ -125,7 +128,7 @@ void App::drawWaveforms(ImVec2 pos, ImVec2 size) {
         ImGui::SetCursorScreenPos(w0);
         ImGui::PushID(d);
         ImGui::InvisibleButton("##lane", ImVec2(w1.x - w0.x, laneH));
-        const bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
+        const bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive(), activated = ImGui::IsItemActivated();
         ImGui::PopID();
         int dropped = acceptLibraryDrop(w0, w1, ImGui::GetID(d == 0 ? "dropWaveA" : "dropWaveB"));
         if (dropped >= 0) requestLoad(d, dropped);
@@ -155,19 +158,33 @@ void App::drawWaveforms(ImVec2 pos, ImVec2 size) {
         dl->AddLine(ImVec2(cx, w0.y), ImVec2(cx, w1.y), IM_COL32(255, 255, 255, 255), 2.0f);
         dl->PopClipRect();
 
-        // Drag = jog: scrubs when paused, bends tempo when playing.
+        // Drag = hand on the record: the track follows the mouse (scratch), playing or not,
+        // and carries on from where you let go. Shift+drag = gentle nudge / silent scrub.
         ImGuiIO& io = ImGui::GetIO();
-        if (active) {
-            jogging[d] = true;
+        if (activated) {
+            grabX[d] = io.MousePos.x;
+            grabPos[d] = dk.pos;
+            dragMode[d] = io.KeyShift ? 2 : 1;
+        }
+        if (active && dragMode[d] == 1) {
+            const double target = std::clamp(grabPos[d] - double(io.MousePos.x - grabX[d]) * fpp, 0.0, double(dk.track->frames()) - 1);
+            engine.scratch(d, true, target);
+        } else if (active && dragMode[d] == 2) {
             if (dk.playing) dk.nudge = std::clamp(-io.MouseDelta.x * 0.006, -0.2, 0.2);
             else dk.pos = std::clamp(dk.pos - io.MouseDelta.x * fpp, 0.0, double(dk.track->frames()) - 1);
-        } else if (jogging[d]) {
-            jogging[d] = false;
-            dk.nudge = 0;
+        } else if (dragMode[d] != 0) {
+            if (dragMode[d] == 1) engine.scratch(d, false, 0);
+            else dk.nudge = 0;
+            dragMode[d] = 0;
+        }
+        if (dk.scratching) {
+            // Hand on the platter.
+            dl->AddText(ImVec2(w0.x + 8, w0.y + 4), IM_COL32(255, 255, 255, 200), dk.slip ? "SCRATCH (slip)" : "SCRATCH");
         }
         if (hovered && io.MouseWheel != 0.0f) waveSeconds = std::clamp(waveSeconds * (io.MouseWheel > 0 ? 0.85f : 1.18f), 2.0f, 40.0f);
         if (hovered && !active)
-            ui::Tip("Drag to jog (scrub when paused, speed up/slow down when playing). Scroll to zoom.");
+            ui::Tip("Grab and drag the waveform to move the record: scratch, rewind or push it forward - it plays on from where you let go.\n"
+                    "Hold still to stop the record. Shift+drag: gentle speed nudge instead. Scroll to zoom.");
     }
     ImGui::End();
 }
@@ -397,7 +414,7 @@ void App::drawDeck(int d, ImVec2 pos, ImVec2 size) {
 
     // Turntable FX.
     ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("STOP FX ");
+    ImGui::TextDisabled("TURNTABLE");
     ImGui::SameLine();
     ImGui::BeginDisabled(!dk.playing || dk.motion != Motion::Normal);
     if (ImGui::Button("Power down")) engine.startMotion(d, Motion::Brake);
@@ -406,6 +423,10 @@ void App::drawDeck(int d, ImVec2 pos, ImVec2 size) {
     if (ImGui::Button("Backspin")) engine.startMotion(d, Motion::Backspin);
     ui::Tip("Spins the record backwards to a stop");
     ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ui::ColoredButton("SLIP", IM_COL32(120, 200, 255, 255), ImVec2(48, 0), dk.slip)) dk.slip = !dk.slip;
+    ui::Tip("Slip mode: while you scratch (drag the waveform), the track keeps running silently underneath.\n"
+            "Let go and it continues exactly where it would have been, so your mix stays on the beat.");
 
     if (ending) {
         ImGui::SameLine();
@@ -507,6 +528,142 @@ void App::drawMixer(ImVec2 pos, ImVec2 size) {
 
 // ---------------------------------------------------------- transition ----
 
+// Transition picker: a grid of cards, each with a preview of its automation curves.
+void App::drawTransitionPicker() {
+    // Centred over the whole app, like an overlay.
+    const ImVec2 ds = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowPos(ImVec2(ds.x * 0.5f, ds.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 14));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, IM_COL32(18, 17, 26, 250));
+    const bool open = ImGui::BeginPopup("##trpicker");
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+    if (!open) return;
+
+    const int out = transitionOutDeck(), in = 1 - out;
+    const Deck& inDk = engine.decks[in];
+    double ratio = 1, fold = 1;
+    const bool bigGap = engine.decks[out].playing && inDk.loaded() && !inDk.playing && engine.computeSync(in, &ratio, &fold) &&
+                        std::fabs(ratio - 1.0) > 0.16 && std::fabs((1.0 + inDk.tempo) / ratio - 1.0) > 0.002;
+    auto anyTempo = [](const TransitionDef& d) { return !d.overlaps() || d.lane(Param::Tempo).enabled; };
+    auto hasFx = [](const TransitionDef& d) { return d.outEffect != OutEffect::None || d.inEffect != InEffect::None; };
+
+    ImGui::PushFont(fontBig, 19.0f);
+    ImGui::TextUnformatted("Choose a transition");
+    ImGui::PopFont();
+    ImGui::SameLine(0, 24);
+    bool anyCustom = false;
+    for (const auto& t : transitions) anyCustom |= !t.stock;
+    const char* filters[] = {"All", "Blends", "Any tempo", "Effects", "Custom"};
+    const ImU32 filterCol[] = {IM_COL32(255, 140, 60, 255), IM_COL32(90, 170, 255, 255), IM_COL32(80, 230, 140, 255),
+                               IM_COL32(255, 90, 170, 255), IM_COL32(180, 130, 255, 255)};
+    for (int f = 0; f < 5; ++f) {
+        if (f == 4 && !anyCustom) continue;
+        ImGui::SameLine(0, 4);
+        if (ui::ColoredButton(filters[f], filterCol[f], ImVec2(0, 0), pickerFilter == f)) pickerFilter = f;
+    }
+    if (pickerFilter == 4 && !anyCustom) pickerFilter = 0;
+    if (bigGap) {
+        ImGui::TextColored(ImVec4(0.45f, 1, 0.6f, 1), "Your decks are %.0f%% apart in tempo: the transitions with a green dot handle that best.",
+                           std::fabs(ratio - 1.0) * 100.0);
+    } else {
+        ImGui::TextDisabled("Blends overlap both tracks and beat-match them. Any-tempo transitions cut or stop the old track, so they work across any tempo gap.");
+    }
+    ImGui::Spacing();
+
+    std::vector<int> shown;
+    for (int i = 0; i < int(transitions.size()); ++i) {
+        const TransitionDef& t = transitions[size_t(i)];
+        bool ok = pickerFilter == 0 || (pickerFilter == 1 && t.overlaps()) || (pickerFilter == 2 && anyTempo(t)) ||
+                  (pickerFilter == 3 && hasFx(t)) || (pickerFilter == 4 && !t.stock);
+        if (ok) shown.push_back(i);
+    }
+
+    const int cols = 6;
+    const ImVec2 card(158, 116);
+    const float gap = 8.0f;
+    const int rows = (int(shown.size()) + cols - 1) / cols;
+    const float gridW = cols * card.x + (cols - 1) * gap;
+    // Fit the window: header and footer take about 190 px.
+    const float maxGrid = std::max(card.y + gap, ds.y * 0.92f - 190.0f);
+    const float gridH = std::min(float(rows) * (card.y + gap), maxGrid);
+    int hovered = -1;
+    ImGui::BeginChild("##trgrid", ImVec2(gridW + 6, gridH), ImGuiChildFlags_None);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    for (size_t k = 0; k < shown.size(); ++k) {
+        const int i = shown[k];
+        const TransitionDef& t = transitions[size_t(i)];
+        if (k % cols) ImGui::SameLine(0, gap);
+        ImGui::PushID(i);
+        const ImVec2 p0 = ImGui::GetCursorScreenPos(), p1(p0.x + card.x, p0.y + card.y);
+        const bool pick = ImGui::InvisibleButton("##card", card);
+        const bool hov = ImGui::IsItemHovered();
+        ImGui::PopID();
+        if (hov) hovered = i;
+        const bool sel = i == selectedTransition;
+        const ImU32 accent = IM_COL32(255, 140, 60, 255);
+        if (sel) {
+            dl->AddRectFilledMultiColor(p0, p1, IM_COL32(70, 38, 30, 255), IM_COL32(70, 30, 60, 255), IM_COL32(40, 22, 40, 255),
+                                        IM_COL32(40, 26, 26, 255));
+        } else {
+            dl->AddRectFilled(p0, p1, hov ? IM_COL32(40, 38, 56, 255) : IM_COL32(26, 25, 36, 255), 7.0f);
+        }
+        dl->AddRect(p0, p1, sel ? accent : hov ? IM_COL32(255, 255, 255, 120) : IM_COL32(255, 255, 255, 25), 7.0f, 0, sel ? 2.0f : 1.0f);
+        drawTransitionThumb(dl, t, ImVec2(p0.x + 8, p0.y + 8), ImVec2(p1.x - 8, p0.y + 54), hov || sel ? 1.0f : 0.8f);
+        dl->PushClipRect(p0, ImVec2(p1.x - 4, p1.y), true);
+        dl->AddText(fontBig, 15.0f, ImVec2(p0.x + 9, p0.y + 60), IM_COL32(255, 255, 255, 240), t.name.c_str());
+        dl->PopClipRect();
+        char meta[48];
+        if (t.beats < 4) std::snprintf(meta, sizeof(meta), "%d beat%s", t.beats, t.beats > 1 ? "s" : "");
+        else std::snprintf(meta, sizeof(meta), "%d beats  -  %d bar%s", t.beats, t.beats / 4, t.beats / 4 > 1 ? "s" : "");
+        dl->AddText(ImVec2(p0.x + 9, p0.y + 78), IM_COL32(255, 255, 255, 110), meta);
+        // Tags.
+        float tx = p0.x + 9;
+        auto tag = [&](const char* text, ImU32 col) {
+            ImVec2 ts = ImGui::CalcTextSize(text);
+            const float sc = 0.8f, tw = ts.x * sc + 8, th = ts.y * sc + 2;
+            ImVec2 a(tx, p1.y - th - 7), b(tx + tw, p1.y - 7);
+            if (b.x > p1.x - 6) return;
+            dl->AddRectFilled(a, b, ui::withAlpha(col, 0.18f), 4.0f);
+            dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * sc, ImVec2(a.x + 4, a.y + 1), col, text);
+            tx = b.x + 4;
+        };
+        if (t.overlaps() && !t.lane(Param::Tempo).enabled) tag("BLEND", filterCol[1]);
+        if (anyTempo(t)) tag("ANY TEMPO", filterCol[2]);
+        if (hasFx(t)) tag("FX", filterCol[3]);
+        if (!t.stock) tag("CUSTOM", filterCol[4]);
+        if (bigGap && anyTempo(t)) {
+            dl->AddCircleFilled(ImVec2(p1.x - 12, p0.y + 12), 7.0f, ui::withAlpha(filterCol[2], 0.3f));
+            dl->AddCircleFilled(ImVec2(p1.x - 12, p0.y + 12), 4.0f, filterCol[2]);
+        }
+        if (pick) {
+            selectedTransition = i;
+            if (!scaleAllowed(transitionScale)) transitionScale = 1.0f;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::EndChild();
+
+    // Details of the hovered (or selected) card.
+    ImGui::Separator();
+    const TransitionDef& info = transitions[size_t(hovered >= 0 ? hovered : selectedTransition)];
+    ImGui::PushTextWrapPos(gridW);
+    ImGui::TextColored(ImVec4(1, 0.7f, 0.45f, 1), "%s", info.name.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d beats%s%s", info.beats, info.outEffect != OutEffect::None ? "  -  out effect" : "",
+                        info.inEffect == InEffect::SpinUp ? "  -  spin-up start" : "");
+    ImGui::TextWrapped("%s", info.description.empty() ? "Custom transition." : info.description.c_str());
+    ImGui::PopTextWrapPos();
+    if (ImGui::SmallButton("Open in Transition Editor")) {
+        trEdit.selected = hovered >= 0 ? hovered : selectedTransition;
+        requestTab = 2;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("  Lines: white = crossfader, colours = EQ / filter / echo / tempo. Green tick = new track starts, red = stop effect.");
+    ImGui::EndPopup();
+}
+
 void App::drawTransitionBar(ImVec2 pos, ImVec2 size) {
     beginPanel("##transition", pos, size);
     const bool busy = engine.transitionBusy();
@@ -514,38 +671,63 @@ void App::drawTransitionBar(ImVec2 pos, ImVec2 size) {
     const int in = 1 - out;
     const bool outPlaying = engine.decks[out].playing;
 
-    ImGui::BeginGroup();
-    ImGui::TextDisabled("TRANSITION");
-    ImGui::SetNextItemWidth(210);
+    // Transition card: opens the picker.
     selectedTransition = std::clamp(selectedTransition, 0, int(transitions.size()) - 1);
-    if (ImGui::BeginCombo("##trsel", transitions[size_t(selectedTransition)].name.c_str(), ImGuiComboFlags_HeightLarge)) {
-        bool customHeader = false;
-        ImGui::SeparatorText("Stock");
-        for (int i = 0; i < int(transitions.size()); ++i) {
-            const TransitionDef& t = transitions[size_t(i)];
-            if (!t.stock && !customHeader) {
-                ImGui::SeparatorText("Custom");
-                customHeader = true;
-            }
-            char lbl[160];
-            std::snprintf(lbl, sizeof(lbl), "%s  (%d beats)", t.name.c_str(), t.beats);
-            if (ImGui::Selectable(lbl, i == selectedTransition)) selectedTransition = i;
-            ui::Tip(t.description.empty() ? "Custom transition" : t.description.c_str());
-        }
-        ImGui::EndCombo();
+    const TransitionDef def = activeTransition();
+    {
+        const TransitionDef& base = transitions[size_t(selectedTransition)];
+        const ImVec2 c0 = ImGui::GetCursorScreenPos(), cs(260, size.y - 16);
+        const bool clicked = ImGui::InvisibleButton("##trcard", cs);
+        const bool hov = ImGui::IsItemHovered();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 c1(c0.x + cs.x, c0.y + cs.y);
+        const ImU32 accent = IM_COL32(255, 140, 60, 255);
+        dl->AddRectFilled(c0, c1, hov ? IM_COL32(40, 34, 52, 255) : IM_COL32(28, 26, 38, 255), 6.0f);
+        dl->AddRect(c0, c1, ui::withAlpha(accent, hov ? 0.9f : 0.45f), 6.0f, 0, 1.5f);
+        drawTransitionThumb(dl, base, ImVec2(c0.x + 6, c0.y + 6), ImVec2(c0.x + 78, c1.y - 6));
+        dl->AddText(ImVec2(c0.x + 86, c0.y + 4), IM_COL32(255, 255, 255, 110), "TRANSITION");
+        dl->AddText(fontBig, 17.0f, ImVec2(c0.x + 86, c0.y + 20), IM_COL32(255, 255, 255, 240), base.name.c_str());
+        // Chevron.
+        const float ax = c1.x - 16, ay = (c0.y + c1.y) * 0.5f;
+        dl->AddTriangleFilled(ImVec2(ax - 5, ay - 3), ImVec2(ax + 5, ay - 3), ImVec2(ax, ay + 3), ui::withAlpha(accent, 0.9f));
+        if (clicked) ImGui::OpenPopup("##trpicker");
+        if (hov) ui::Tip((base.description + "\n\nClick to browse all transitions.").c_str());
+        drawTransitionPicker();
     }
-    ui::Tip(transitions[size_t(selectedTransition)].description.c_str());
-    ImGui::EndGroup();
-    ImGui::SameLine();
+    ImGui::SameLine(0, 14);
 
-    const TransitionDef& def = transitions[size_t(selectedTransition)];
+    // Length: the transition's own length times a multiplier.
     {
         ImGui::BeginGroup();
         const Deck& o = engine.decks[out];
         double spb = o.loaded() ? o.secPerBeat() / std::max(0.25, o.rate()) : 0.5;
         ImGui::TextDisabled("LENGTH");
-        ImGui::AlignTextToFramePadding();
-        ImGui::Text("%d beats (%.1fs)", def.beats, def.beats * spb);
+        ImGui::SameLine();
+        if (transitionScale != 1.0f && scaleAllowed(transitionScale))
+            ImGui::TextColored(ImVec4(1, 0.75f, 0.35f, 1), "%d beats  %.1fs", def.beats, def.beats * spb);
+        else
+            ImGui::Text("%d beats  %.1fs", def.beats, def.beats * spb);
+        static const float kScales[] = {0.25f, 0.5f, 1.0f, 2.0f, 4.0f};
+        static const char* kLabels[] = {"1/4", "1/2", "x1", "x2", "x4"};
+        for (int k = 0; k < 5; ++k) {
+            if (k) ImGui::SameLine(0, 2);
+            const bool ok = scaleAllowed(kScales[k]);
+            ImGui::BeginDisabled(!ok || busy);
+            char lbl[16];
+            std::snprintf(lbl, sizeof(lbl), "%s##len%d", kLabels[k], k);
+            if (ui::ColoredButton(lbl, IM_COL32(255, 140, 60, 255), ImVec2(36, 0), transitionScale == kScales[k] && ok))
+                transitionScale = kScales[k];
+            ImGui::EndDisabled();
+            if (ok) {
+                char tip[96];
+                std::snprintf(tip, sizeof(tip), "%d beats (%d bars). Shortcut: [ and ] halve / double.",
+                              int(std::lround(transitions[size_t(selectedTransition)].beats * kScales[k])),
+                              std::max(1, int(std::lround(transitions[size_t(selectedTransition)].beats * kScales[k])) / 4));
+                ui::Tip(tip);
+            } else {
+                ui::Tip("Too short or too long for this transition");
+            }
+        }
         ImGui::EndGroup();
     }
     ImGui::SameLine(0, 18);
@@ -597,7 +779,16 @@ void App::drawTransitionBar(ImVec2 pos, ImVec2 size) {
         std::snprintf(ov, sizeof(ov), "%d%%", int(engine.run.progress * 100));
         ImGui::ProgressBar(engine.run.progress, ImVec2(progW, 0), ov);
     } else {
-        ImGui::TextDisabled("%s", def.description.c_str());
+        // Blends need matching tempos; warn before a big stretch and point at transitions that don't.
+        double ratio = 1, fold = 1;
+        const Deck& inDk = engine.decks[in];
+        const bool bigGap = outPlaying && inDk.loaded() && !inDk.playing && engine.computeSync(in, &ratio, &fold) &&
+                            std::fabs(ratio - 1.0) > 0.16 && std::fabs((1.0 + inDk.tempo) / ratio - 1.0) > 0.002;
+        if (bigGap && def.overlaps() && !def.lane(Param::Tempo).enabled)
+            ImGui::TextColored(ImVec4(1, 0.82f, 0.3f, 1), "Tempo gap %.0f%%: this blend will stretch deck %c. Tempo Ramp, Echo Out or Power Swap sound more natural.",
+                               std::fabs(ratio - 1.0) * 100.0, 'A' + in);
+        else
+            ImGui::TextDisabled("%s", def.description.c_str());
         ImGui::ProgressBar(0.0f, ImVec2(progW, 0), "ready");
     }
     ImGui::EndGroup();

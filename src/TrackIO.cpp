@@ -3,6 +3,19 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <vector>
+
+#if defined(__APPLE__)
+#include <AudioToolbox/AudioToolbox.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#endif
 
 #include "Track.h"
 #include "dr_flac.h"
@@ -28,6 +41,192 @@ std::string fileStem(const std::string& path) {
     auto dot = f.find_last_of('.');
     return dot == std::string::npos ? f : f.substr(0, dot);
 }
+
+constexpr double kMaxImportSeconds = 60.0 * 30.0;
+
+#if defined(__APPLE__)
+// Decodes anything Core Audio understands (AAC/ALAC .m4a, AIFF, CAF...) straight to
+// float stereo at kSampleRate - the system converter does the resampling.
+bool decodeCoreAudio(const std::string& path, std::vector<float>& out, std::string* error) {
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, (const UInt8*)path.c_str(), CFIndex(path.size()), false);
+    if (!url) return false;
+    ExtAudioFileRef file = nullptr;
+    OSStatus st = ExtAudioFileOpenURL(url, &file);
+    CFRelease(url);
+    if (st != noErr || !file) {
+        if (error) *error = "Could not open " + fileStem(path) + " (it may be DRM-protected)";
+        return false;
+    }
+    AudioStreamBasicDescription src{};
+    UInt32 size = sizeof(src);
+    SInt64 srcFrames = 0;
+    UInt32 fsize = sizeof(srcFrames);
+    bool ok = ExtAudioFileGetProperty(file, kExtAudioFileProperty_FileDataFormat, &size, &src) == noErr &&
+              ExtAudioFileGetProperty(file, kExtAudioFileProperty_FileLengthFrames, &fsize, &srcFrames) == noErr &&
+              src.mSampleRate > 0;
+    if (ok && double(srcFrames) / src.mSampleRate > kMaxImportSeconds) {
+        ExtAudioFileDispose(file);
+        if (error) *error = "File is longer than 30 minutes; please trim it first";
+        return false;
+    }
+    const UInt32 ch = src.mChannelsPerFrame >= 2 ? 2 : 1;
+    AudioStreamBasicDescription dst{};
+    dst.mSampleRate = kSampleRate;
+    dst.mFormatID = kAudioFormatLinearPCM;
+    dst.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+    dst.mChannelsPerFrame = ch;
+    dst.mBitsPerChannel = 32;
+    dst.mBytesPerFrame = dst.mBytesPerPacket = 4 * ch;
+    dst.mFramesPerPacket = 1;
+    ok = ok && ExtAudioFileSetProperty(file, kExtAudioFileProperty_ClientDataFormat, sizeof(dst), &dst) == noErr;
+    if (ok) {
+        out.clear();
+        out.reserve(size_t(double(srcFrames) * kSampleRate / src.mSampleRate + 16) * 2);
+        std::vector<float> buf(size_t(8192) * ch);
+        for (;;) {
+            AudioBufferList abl{};
+            abl.mNumberBuffers = 1;
+            abl.mBuffers[0].mNumberChannels = ch;
+            abl.mBuffers[0].mDataByteSize = UInt32(buf.size() * sizeof(float));
+            abl.mBuffers[0].mData = buf.data();
+            UInt32 frames = 8192;
+            if (ExtAudioFileRead(file, &frames, &abl) != noErr) {
+                ok = false;
+                break;
+            }
+            if (frames == 0) break;
+            for (UInt32 i = 0; i < frames; ++i) {
+                out.push_back(buf[i * ch]);
+                out.push_back(buf[i * ch + (ch - 1)]);  // mono: duplicate
+            }
+        }
+    }
+    ExtAudioFileDispose(file);
+    if (!ok || out.empty()) {
+        if (error && error->empty()) *error = "Could not decode " + fileStem(path);
+        return false;
+    }
+    return true;
+}
+#endif
+
+#if defined(_WIN32)
+// Media Foundation, loaded at runtime: Windows "N" editions ship without it, and a
+// static import would stop the whole app from starting there.
+struct MediaFoundation {
+    HRESULT(WINAPI* startup)(ULONG, DWORD) = nullptr;
+    HRESULT(WINAPI* shutdown)() = nullptr;
+    HRESULT(WINAPI* createMediaType)(IMFMediaType**) = nullptr;
+    HRESULT(WINAPI* createSourceReaderFromURL)(LPCWSTR, IMFAttributes*, IMFSourceReader**) = nullptr;
+
+    static const MediaFoundation* get() {
+        static const MediaFoundation mf = [] {
+            MediaFoundation m;
+            HMODULE plat = LoadLibraryW(L"mfplat.dll"), rw = LoadLibraryW(L"mfreadwrite.dll");
+            if (!plat || !rw) return m;
+            m.startup = reinterpret_cast<decltype(m.startup)>(reinterpret_cast<void*>(GetProcAddress(plat, "MFStartup")));
+            m.shutdown = reinterpret_cast<decltype(m.shutdown)>(reinterpret_cast<void*>(GetProcAddress(plat, "MFShutdown")));
+            m.createMediaType =
+                reinterpret_cast<decltype(m.createMediaType)>(reinterpret_cast<void*>(GetProcAddress(plat, "MFCreateMediaType")));
+            m.createSourceReaderFromURL = reinterpret_cast<decltype(m.createSourceReaderFromURL)>(
+                reinterpret_cast<void*>(GetProcAddress(rw, "MFCreateSourceReaderFromURL")));
+            return m;
+        }();
+        return mf.startup && mf.shutdown && mf.createMediaType && mf.createSourceReaderFromURL ? &mf : nullptr;
+    }
+};
+
+// Decodes anything Media Foundation understands (AAC/ALAC .m4a, WMA...) to
+// interleaved float at the file's own rate; the caller resamples.
+bool decodeMediaFoundation(const std::string& path, std::vector<float>& out, unsigned* channels, unsigned* rate,
+                           std::string* error) {
+    const MediaFoundation* mf = MediaFoundation::get();
+    if (!mf) {
+        if (error) *error = "M4A/WMA needs Windows Media Foundation (install the Media Feature Pack)";
+        return false;
+    }
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(mf->startup(MF_VERSION, MFSTARTUP_LITE))) {
+        if (SUCCEEDED(com)) CoUninitialize();
+        if (error) *error = "Windows Media Foundation is not available";
+        return false;
+    }
+    std::wstring wpath(size_t(MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0)), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), int(wpath.size()));
+    IMFSourceReader* reader = nullptr;
+    IMFMediaType* type = nullptr;
+    IMFMediaType* actual = nullptr;
+    bool ok = SUCCEEDED(mf->createSourceReaderFromURL(wpath.c_str(), nullptr, &reader));
+    if (!ok && error) *error = "Could not open " + fileStem(path) + " (it may be DRM-protected)";
+    const DWORD stream = DWORD(MF_SOURCE_READER_FIRST_AUDIO_STREAM);
+    if (ok) {
+        PROPVARIANT dur;
+        PropVariantInit(&dur);
+        if (SUCCEEDED(reader->GetPresentationAttribute(DWORD(MF_SOURCE_READER_MEDIASOURCE), MF_PD_DURATION, &dur)) &&
+            dur.vt == VT_UI8 && double(dur.uhVal.QuadPart) / 1e7 > kMaxImportSeconds) {
+            ok = false;
+            if (error) *error = "File is longer than 30 minutes; please trim it first";
+        }
+        PropVariantClear(&dur);
+    }
+    ok = ok && SUCCEEDED(reader->SetStreamSelection(DWORD(MF_SOURCE_READER_ALL_STREAMS), FALSE)) &&
+         SUCCEEDED(reader->SetStreamSelection(stream, TRUE)) && SUCCEEDED(mf->createMediaType(&type)) &&
+         SUCCEEDED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio)) &&
+         SUCCEEDED(type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float)) &&
+         SUCCEEDED(reader->SetCurrentMediaType(stream, nullptr, type)) &&
+         SUCCEEDED(reader->GetCurrentMediaType(stream, &actual));
+    UINT32 ch = 0, sr = 0;
+    if (ok) {
+        ch = MFGetAttributeUINT32(actual, MF_MT_AUDIO_NUM_CHANNELS, 0);
+        sr = MFGetAttributeUINT32(actual, MF_MT_AUDIO_SAMPLES_PER_SECOND, 0);
+        ok = ch > 0 && sr > 0;
+    }
+    if (ok) {
+        out.clear();
+        for (;;) {
+            DWORD flags = 0;
+            IMFSample* sample = nullptr;
+            if (FAILED(reader->ReadSample(stream, 0, nullptr, &flags, nullptr, &sample))) {
+                ok = false;
+                break;
+            }
+            if (sample) {
+                IMFMediaBuffer* buf = nullptr;
+                if (SUCCEEDED(sample->ConvertToContiguousBuffer(&buf))) {
+                    BYTE* data = nullptr;
+                    DWORD len = 0;
+                    if (SUCCEEDED(buf->Lock(&data, nullptr, &len))) {
+                        const float* f = reinterpret_cast<const float*>(data);
+                        out.insert(out.end(), f, f + len / sizeof(float));
+                        buf->Unlock();
+                    }
+                    buf->Release();
+                }
+                sample->Release();
+            }
+            if (flags & (MF_SOURCE_READERF_ENDOFSTREAM | MF_SOURCE_READERF_ERROR)) break;
+            if (double(out.size()) / ch / sr > kMaxImportSeconds + 1) {
+                ok = false;
+                if (error) *error = "File is longer than 30 minutes; please trim it first";
+                break;
+            }
+        }
+    }
+    if (actual) actual->Release();
+    if (type) type->Release();
+    if (reader) reader->Release();
+    mf->shutdown();
+    if (SUCCEEDED(com)) CoUninitialize();
+    if (!ok || out.size() < ch) {
+        if (error && error->empty()) *error = "Could not decode " + fileStem(path);
+        return false;
+    }
+    out.resize(out.size() - out.size() % ch);
+    *channels = ch;
+    *rate = sr;
+    return true;
+}
+#endif
 
 }  // namespace
 
@@ -219,12 +418,27 @@ double detectBpm(const Track& t, double* firstBeatSec) {
     return bestBpm;
 }
 
-TrackPtr loadAudioFile(const std::string& path, std::string* error) {
+TrackPtr loadAudioFile(const std::string& path, std::string* error, bool detectTempo) {
     std::string ext = lowerExt(path);
+#if defined(__APPLE__)
+    if (ext == "m4a" || ext == "aac" || ext == "aif" || ext == "aiff" || ext == "aifc" || ext == "caf") {
+        auto t = std::make_shared<Track>();
+        if (!decodeCoreAudio(path, t->samples, error)) return nullptr;
+        t->name = fileStem(path);
+        t->artist = "Imported";
+        t->genre = "Imported";
+        t->key = "?";
+        t->sourcePath = path;
+        if (detectTempo) t->bpm = detectBpm(*t, &t->firstBeatSec);
+        analyzeTrack(*t);
+        return t;
+    }
+#endif
     unsigned int channels = 0, rate = 0;
     drwav_uint64 count = 0;
     float* pcm = nullptr;
     void (*freeFn)(void*) = nullptr;
+    std::vector<float> decoded;  // system decoder output (Windows)
 
     if (ext == "wav") {
         pcm = drwav_open_file_and_read_pcm_frames_f32(path.c_str(), &channels, &rate, &count, nullptr);
@@ -242,8 +456,15 @@ TrackPtr loadAudioFile(const std::string& path, std::string* error) {
         pcm = drflac_open_file_and_read_pcm_frames_f32(path.c_str(), &channels, &rate, &c, nullptr);
         count = c;
         freeFn = [](void* p) { drflac_free(p, nullptr); };
+#if defined(_WIN32)
+    } else if (ext == "m4a" || ext == "aac" || ext == "wma") {
+        if (!decodeMediaFoundation(path, decoded, &channels, &rate, error)) return nullptr;
+        count = decoded.size() / channels;
+        pcm = decoded.data();
+        freeFn = [](void*) {};  // owned by `decoded`
+#endif
     } else {
-        if (error) *error = "Unsupported file type '." + ext + "' (use WAV, MP3 or FLAC)";
+        if (error) *error = "Unsupported file type '." + ext + "'";
         return nullptr;
     }
     if (!pcm || channels == 0 || rate == 0 || count == 0) {
@@ -251,7 +472,7 @@ TrackPtr loadAudioFile(const std::string& path, std::string* error) {
         if (error) *error = "Could not decode " + fileStem(path) + "." + ext;
         return nullptr;
     }
-    if (double(count) / rate > 60.0 * 30.0) {
+    if (double(count) / rate > kMaxImportSeconds) {
         freeFn(pcm);
         if (error) *error = "File is longer than 30 minutes; please trim it first";
         return nullptr;
@@ -281,7 +502,7 @@ TrackPtr loadAudioFile(const std::string& path, std::string* error) {
     }
     freeFn(pcm);
 
-    t->bpm = detectBpm(*t, &t->firstBeatSec);
+    if (detectTempo) t->bpm = detectBpm(*t, &t->firstBeatSec);
     analyzeTrack(*t);
     return t;
 }

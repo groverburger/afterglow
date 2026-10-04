@@ -2,3 +2,5 @@ build/
 user_data/
 imgui.ini
 .DS_Store
+build-win/
+dist/
