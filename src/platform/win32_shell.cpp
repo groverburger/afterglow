@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <filesystem>
+#include <iterator>
 
 namespace fs = std::filesystem;
 

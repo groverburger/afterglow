@@ -49,6 +49,15 @@ cmake --build build --parallel
 ./build/Afterglow
 ```
 
+### Releases
+
+Publishing a GitHub release runs `.github/workflows/release.yml`, which builds
+and attaches `Afterglow-<tag>-windows-x64.zip` (portable, MSVC with the static
+runtime) and `Afterglow-<tag>-macos.dmg` (universal app, macOS 11+, made by
+`tools/package_macos.sh`). Neither is code-signed: Windows SmartScreen needs
+"More info > Run anyway", and on macOS the first launch needs right-click >
+Open (or System Settings > Privacy & Security > Open Anyway).
+
 Run the tests with `ctest --test-dir build -C Release`. CI
 (`.github/workflows/build.yml`) builds and tests all three platforms.
 

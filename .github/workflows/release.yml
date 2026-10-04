@@ -1,0 +1,75 @@
+# Publishing a GitHub release builds Afterglow for Windows and macOS and attaches
+#   Afterglow-<tag>-windows-x64.zip  (portable: unzip and run Afterglow.exe)
+#   Afterglow-<tag>-macos.dmg        (universal app, drag to Applications)
+# Run it by hand (Actions > Release > Run workflow) to rebuild a release's files,
+# or with no tag to just build them as workflow artifacts.
+name: Release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the builds to (empty = build only)
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+      - run: cmake -S . -B build
+      - run: cmake --build build --config Release --parallel
+      - run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = if ($env:TAG) { $env:TAG } else { "dev" }
+          $stage = "package/Afterglow"
+          New-Item -ItemType Directory -Force "$stage/licenses", dist | Out-Null
+          Copy-Item build/Release/Afterglow.exe $stage/
+          Copy-Item packaging/windows-README.txt $stage/README.txt
+          Copy-Item assets/Roboto-LICENSE.txt "$stage/licenses/Roboto.txt"
+          Copy-Item third_party/imgui/LICENSE.txt "$stage/licenses/Dear ImGui.txt"
+          Copy-Item third_party/sokol/LICENSE "$stage/licenses/sokol.txt"
+          Copy-Item third_party/dr_libs/LICENSE "$stage/licenses/dr_libs.txt"
+          Compress-Archive -Path package/Afterglow -DestinationPath "dist/Afterglow-$version-windows-x64.zip"
+          "ASSET=dist/Afterglow-$version-windows-x64.zip" >> $env:GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: ${{ env.ASSET }}
+      - name: Attach to release
+        if: env.TAG != ''
+        run: gh release upload "$env:TAG" "$env:ASSET" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
+      - name: Build and package
+        run: |
+          VERSION=${TAG:-dev}
+          sh tools/package_macos.sh "$VERSION"
+          echo "ASSET=dist/Afterglow-$VERSION-macos.dmg" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: ${{ env.ASSET }}
+      - name: Attach to release
+        if: env.TAG != ''
+        run: gh release upload "$TAG" "$ASSET" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

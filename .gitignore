@@ -4,3 +4,4 @@ imgui.ini
 .DS_Store
 build-win/
 dist/
+build-mac/

@@ -17,6 +17,8 @@ if(MINGW)
   string(APPEND CMAKE_EXE_LINKER_FLAGS " -static")
 endif()
 if(MSVC)
+  # Static C++ runtime: the exe runs without the Visual C++ Redistributable.
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   set(AFTERGLOW_WARNINGS /W4)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()
