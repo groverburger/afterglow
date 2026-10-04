@@ -84,6 +84,6 @@ void win32SetWindowIcon(const void* hwnd) {
     auto load = [&](int metricX, int metricY) {
         return HANDLE(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(metricX), GetSystemMetrics(metricY), 0));
     };
-    if (HANDLE big = load(SM_CXICON, SM_CYICON)) SendMessageW(w, WM_SETICON, ICON_BIG, LPARAM(big));
-    if (HANDLE small = load(SM_CXSMICON, SM_CYSMICON)) SendMessageW(w, WM_SETICON, ICON_SMALL, LPARAM(small));
+    if (HANDLE bigIcon = load(SM_CXICON, SM_CYICON)) SendMessageW(w, WM_SETICON, ICON_BIG, LPARAM(bigIcon));
+    if (HANDLE smallIcon = load(SM_CXSMICON, SM_CYSMICON)) SendMessageW(w, WM_SETICON, ICON_SMALL, LPARAM(smallIcon));
 }
