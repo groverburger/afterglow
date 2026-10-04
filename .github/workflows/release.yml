@@ -2,7 +2,7 @@
 #   Afterglow-<tag>-windows-x64.zip  (portable: unzip and run Afterglow.exe)
 #   Afterglow-<tag>-macos.dmg        (universal app, drag to Applications)
 # Run it by hand (Actions > Release > Run workflow) to rebuild a release's files,
-# or with no tag to just build them as workflow artifacts.
+# or with no tag to only build them (kept as workflow artifacts).
 name: Release
 on:
   release:
